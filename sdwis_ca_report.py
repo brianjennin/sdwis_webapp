@@ -3,6 +3,8 @@ import sys
 import re
 import requests
 import pandas as pd
+import functools
+
 
 # Optional: silence HTTPS warnings if your env uses unverified TLS
 import urllib3
@@ -23,7 +25,7 @@ TABLE_FIELDS = {
         "POPULATION_SERVED_COUNT", "PRIMARY_SOURCE_CODE", "OWNER_TYPE_CODE",
         "GW_SW_CODE", "IS_GRANT_ELIGIBLE_IND", "IS_WHOLESALER_IND",
         "SERVICE_CONNECTIONS_COUNT", "ORG_NAME", "ADMIN_NAME", "EMAIL_ADDR",
-        "STATE_CODE"
+        "STATE_CODE", "CITY_NAME"
     ],
     "GEOGRAPHIC_AREA": [
         "PWSID", "TRIBAL_CODE", "STATE_SERVED", "CITY_SERVED", "COUNTY_SERVED"
@@ -140,66 +142,127 @@ def token_and_contains(series: pd.Series, tokens: list[str]) -> pd.Series:
             mask &= series.astype(str).str.contains(re.escape(t), case=False, na=False)
     return mask
 
+# ------- Lightweight caches for CLI --------
+
+@functools.lru_cache(maxsize=64)
+def _ws_by_state_cached(state_code: str) -> pd.DataFrame:
+    """WATER_SYSTEM filtered by state, UPPER-cased columns."""
+    ws = pull_rows_filtered("WATER_SYSTEM", "STATE_CODE", state_code)
+    return df_upper(ws)
+
+@functools.lru_cache(maxsize=1)
+def _ga_all_cached() -> pd.DataFrame:
+    """Bulk GEOGRAPHIC_AREA once; keep common columns; UPPER-cased."""
+    ga = pull_rows_paged("GEOGRAPHIC_AREA")
+    ga = df_upper(ga)
+    keep = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED", "STATE_SERVED"] if c in ga.columns]
+    ga = ga[keep] if keep else ga
+    subset = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
+    return ga.drop_duplicates(subset=subset) if subset else ga.drop_duplicates()
+
+
 # ----------------------- Search (state-aware) -----------------------
 
 def search_by_name(state_code: str, name_query: str, county_filter: str | None) -> pd.DataFrame:
     """
-    Generic search by STATE_CODE first, then optional name tokens and county.
-    - Pull WATER_SYSTEM filtered by STATE_CODE (server-side).
-    - If name is blank, return all systems for the state (optionally filter by county).
-    - If county given, fetch GEOGRAPHIC_AREA per-candidate PWSID to match county (no STATE_SERVED dependency).
+    Fast CLI search:
+      - WATER_SYSTEM filtered by STATE_CODE (server-side)  [cached]
+      - GEOGRAPHIC_AREA pulled once and filtered locally   [cached]
+      - Optional name token filter (AND across tokens)
+      - Optional county/city filter against GA.COUNTY_SERVED or GA.CITY_SERVED
+      - Returns a compact table with PWSID, PWS_NAME, CITY (prefers WS.CITY_NAME, else GA.CITY_SERVED), COUNTY_SERVED
     """
     sc = (state_code or "").strip().upper()
     if not re.fullmatch(r"[A-Z]{2}", sc):
         return pd.DataFrame()
 
-    q = (name_query or "").strip()
-    tokens = re.findall(r"[A-Za-z0-9]+", q) if q else []
-
-    # 1) WATER_SYSTEM filtered by state
-    ws = pull_rows_filtered("WATER_SYSTEM", "STATE_CODE", sc)
-    print(f"[DEBUG] Pulled WATER_SYSTEM ({sc}): {len(ws)}")
+    # 1) Base WATER_SYSTEM (by state)
+    ws = _ws_by_state_cached(sc)
     if ws.empty or "PWSID" not in ws.columns or "PWS_NAME" not in ws.columns:
         return pd.DataFrame()
 
-    # 2) Name filtering (optional)
-    if tokens:
-        m = token_and_contains(ws["PWS_NAME"], tokens)
-        ws = ws[m]
-        print(f"[DEBUG] Name token matches ({sc}): {len(ws)}")
-        if ws.empty:
-            return pd.DataFrame()
+    # Keep only what we need (include CITY_NAME if present)
+    keep_ws = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
+    ws = ws[keep_ws].drop_duplicates("PWSID") if keep_ws else ws
 
-    # If no county filter, return WS matches now
+    # 2) Optional name filter (AND across tokens)
+    q = (name_query or "").strip()
+    if q and "PWS_NAME" in ws.columns:
+        tokens = re.findall(r"[A-Za-z0-9]+", q)
+        if tokens:
+            m = token_and_contains(ws["PWS_NAME"], tokens)
+            ws = ws[m]
+            if ws.empty:
+                return pd.DataFrame()
+
+    # 3) If no county/city filter → return early (fast)
     if not county_filter:
-        show_cols = [c for c in ["PWSID", "PWS_NAME"] if c in ws.columns]
-        if not show_cols:
-            show_cols = ["PWSID"]
-        return ws[show_cols].drop_duplicates("PWSID").reset_index(drop=True)
+        out = ws.copy()
+        # Build CITY from CITY_NAME if present
+        if "CITY_NAME" in out.columns:
+            out["CITY"] = out["CITY_NAME"].fillna("").astype(str).str.strip()
+        show = [c for c in ["PWSID", "PWS_NAME", "CITY"] if c in out.columns]
+        if not show:
+            show = [c for c in ["PWSID", "PWS_NAME"] if c in out.columns]
+        return out[show].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
-    # 3) County filter given -> fetch GA per candidate (no STATE_SERVED filter)
-    c = county_filter.strip().upper()
-    rows = []
-    cand_ws = ws[["PWSID", "PWS_NAME"]].drop_duplicates("PWSID")
-    for _, r in cand_ws.iterrows():
-        pwsid = r["PWSID"]
-        ga_df = fetch_table_by_pwsid("GEOGRAPHIC_AREA", pwsid)
-        ga_df = df_upper(ga_df)
-        county = next((str(x).strip() for x in ga_df.get("COUNTY_SERVED", pd.Series()).dropna().astype(str) if x.strip()), "")
-        city   = next((str(x).strip() for x in ga_df.get("CITY_SERVED",   pd.Series()).dropna().astype(str) if x.strip()), "")
-        if county and c in county.upper():
-            rows.append({"PWSID": pwsid, "PWS_NAME": r["PWS_NAME"], "CITY_SERVED": city, "COUNTY_SERVED": county})
+    # 4) County/city filter → do a single bulk GA filter & local join
+    ga = _ga_all_cached()
+    if ga.empty or "PWSID" not in ga.columns:
+        # No GA available, fall back to WS-only
+        out = ws.copy()
+        if "CITY_NAME" in out.columns:
+            out["CITY"] = out["CITY_NAME"].fillna("").astype(str).str.strip()
+        show = [c for c in ["PWSID", "PWS_NAME", "CITY"] if c in out.columns]
+        if not show:
+            show = [c for c in ["PWSID", "PWS_NAME"] if c in out.columns]
+        return out[show].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
-    if not rows:
-        # Soft fallback: name/state matches even if county missing
-        return cand_ws.reset_index(drop=True)
+    # Filter GA to the state via PWSID prefix (robust even if STATE_SERVED missing)
+    ga_state = ga[ga["PWSID"].astype(str).str.startswith(sc)]
 
-    out = pd.DataFrame(rows).drop_duplicates("PWSID").sort_values(["COUNTY_SERVED", "PWS_NAME"])
-    return out.reset_index(drop=True)
+    term = county_filter.strip().lower()
+    # Use Series(False, index=ga_state.index) when the column is missing
+    m_county = (
+        ga_state["COUNTY_SERVED"].astype(str).str.lower().str.contains(term, na=False)
+        if "COUNTY_SERVED" in ga_state.columns
+        else pd.Series(False, index=ga_state.index)
+    )
+    m_citysv = (
+        ga_state["CITY_SERVED"].astype(str).str.lower().str.contains(term, na=False)
+        if "CITY_SERVED" in ga_state.columns
+        else pd.Series(False, index=ga_state.index)
+    )
+    ga_match = ga_state[m_county | m_citysv]
 
-# Backward-compat convenience for CA-only callers (optional)
-def search_by_name_ca(name_query: str, county_filter: str | None) -> pd.DataFrame:
-    return search_by_name("CA", name_query, county_filter)
+    if ga_match.empty:
+        # Nothing matched in GA; fall back to WS-only
+        out = ws.copy()
+        if "CITY_NAME" in out.columns:
+            out["CITY"] = out["CITY_NAME"].fillna("").astype(str).str.strip()
+        show = [c for c in ["PWSID", "PWS_NAME", "CITY"] if c in out.columns]
+        if not show:
+            show = [c for c in ["PWSID", "PWS_NAME"] if c in out.columns]
+        return out[show].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
+
+    # Join WS with GA matches to keep only systems in the county/city selection
+    merge_cols = ["PWSID", "CITY_SERVED", "COUNTY_SERVED"]
+    merge_cols = [c for c in merge_cols if c in ga_match.columns]
+    out = ws.merge(ga_match[merge_cols], on="PWSID", how="inner")
+
+    # Build unified CITY column: prefer WS.CITY_NAME, else GA.CITY_SERVED
+    if "CITY" not in out.columns:
+        out["CITY"] = ""
+    if "CITY_NAME" in out.columns:
+        out["CITY"] = out["CITY"].mask(out["CITY"].eq(""), out["CITY_NAME"].fillna("").astype(str).str.strip())
+    if "CITY_SERVED" in out.columns:
+        out["CITY"] = out["CITY"].mask(out["CITY"].eq(""), out["CITY_SERVED"].fillna("").astype(str).str.strip())
+
+    # Final view
+    show = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in out.columns]
+    if not show:
+        show = [c for c in ["PWSID", "PWS_NAME"] if c in out.columns]
+    return out[show].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
 # ----------------------- Fetch tables & report -----------------------
 
@@ -246,7 +309,17 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     ga = data.get("GEOGRAPHIC_AREA", pd.DataFrame())
     ws_name = ws.iloc[0]["PWS_NAME"] if not ws.empty and "PWS_NAME" in ws.columns else "N/A"
     county = ga.iloc[0]["COUNTY_SERVED"] if not ga.empty and "COUNTY_SERVED" in ga.columns else "N/A"
-    city = ga.iloc[0]["CITY_SERVED"] if not ga.empty and "CITY_SERVED" in ga.columns else "N/A"
+    # Prefer CITY_NAME from WATER_SYSTEM; fallback to GA.CITY_SERVED; else N/A
+    city = "N/A"
+    if not ws.empty and "CITY_NAME" in ws.columns:
+        v = str(ws.iloc[0].get("CITY_NAME", "")).strip()
+        if v:
+            city = v
+    if city == "N/A" and not ga.empty and "CITY_SERVED" in ga.columns:
+        v = str(ga.iloc[0].get("CITY_SERVED", "")).strip()
+        if v:
+            city = v
+
     state = ws.iloc[0]["STATE_CODE"] if not ws.empty and "STATE_CODE" in ws.columns else (pwsid[:2] if isinstance(pwsid, str) else "N/A")
 
     doc.add_paragraph(f"Water System Name: {ws_name}")
@@ -296,7 +369,7 @@ def main():
             sys.exit(0)
 
         name = input("Water system name (optional): ").strip()
-        county_hint = input("County (optional): ").strip() or None
+        county_hint = input("County or City (optional): ").strip() or None
         print(f"\nSearching {sc}…")
         matches = search_by_name(sc, name_query=name, county_filter=county_hint)
         if matches.empty:
