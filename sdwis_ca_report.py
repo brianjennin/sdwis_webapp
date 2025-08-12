@@ -22,7 +22,8 @@ TABLE_FIELDS = {
         "PWSID", "PWS_ACTIVITY_CODE", "PWS_TYPE_CODE", "PWS_NAME",
         "POPULATION_SERVED_COUNT", "PRIMARY_SOURCE_CODE", "OWNER_TYPE_CODE",
         "GW_SW_CODE", "IS_GRANT_ELIGIBLE_IND", "IS_WHOLESALER_IND",
-        "SERVICE_CONNECTIONS_COUNT", "ORG_NAME", "ADMIN_NAME", "EMAIL_ADDR"
+        "SERVICE_CONNECTIONS_COUNT", "ORG_NAME", "ADMIN_NAME", "EMAIL_ADDR",
+        "STATE_CODE"
     ],
     "GEOGRAPHIC_AREA": [
         "PWSID", "TRIBAL_CODE", "STATE_SERVED", "CITY_SERVED", "COUNTY_SERVED"
@@ -62,17 +63,24 @@ MAX_PAGES = 10   # up to ~500k rows per table
 BASE = "https://data.epa.gov/efservice"
 PWSID_URL = BASE + "/{table}/PWSID/{pwsid}/JSON"
 ROWS_URL  = BASE + "/{table}/Rows/{start}:{end}/JSON"
+FILTER_URL = BASE + "/{table}/{col}/{val}/Rows/{start}:{end}/JSON"
 
 # ----------------------- HTTP helpers -----------------------
+
+# (Optional) persistent session w/ small retry pool
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
 def api_get_json(url: str):
     """GET with verify True then fallback to False (common in corp envs)."""
     try:
-        r = requests.get(url, timeout=60)
+        r = _session.get(url, timeout=60)
         r.raise_for_status()
         return r.json()
     except Exception:
-        r = requests.get(url, timeout=60, verify=False)
+        r = _session.get(url, timeout=60, verify=False)
         r.raise_for_status()
         return r.json()
 
@@ -101,8 +109,6 @@ def pull_rows_paged(table: str, page_size: int = PAGE_SIZE, max_pages: int = MAX
         return pd.DataFrame()
     return df_upper(pd.concat(parts, ignore_index=True))
 
-FILTER_URL = BASE + "/{table}/{col}/{val}/Rows/{start}:{end}/JSON"
-
 def pull_rows_filtered(table: str, col: str, val: str,
                        page_size: int = PAGE_SIZE, max_pages: int = MAX_PAGES) -> pd.DataFrame:
     """Pull rows from EPA API with a server-side filter to reduce data size."""
@@ -123,7 +129,6 @@ def pull_rows_filtered(table: str, col: str, val: str,
         return pd.DataFrame()
     return df_upper(pd.concat(parts, ignore_index=True))
 
-
 def looks_like_pwsid(s: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z]{2}\d{7}", s.strip()))
 
@@ -135,90 +140,66 @@ def token_and_contains(series: pd.Series, tokens: list[str]) -> pd.Series:
             mask &= series.astype(str).str.contains(re.escape(t), case=False, na=False)
     return mask
 
-def enforce_california(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep rows that are clearly CA via STATE_SERVED OR STATE_CODE OR PWSID prefix."""
-    if df.empty:
-        return df
-    masks = []
-    if "STATE_SERVED" in df.columns:
-        masks.append(df["STATE_SERVED"].astype(str).str.strip().str.upper().eq("CA"))
-    if "STATE_CODE" in df.columns:
-        masks.append(df["STATE_CODE"].astype(str).str.strip().str.upper().eq("CA"))
-    if "PWSID" in df.columns:
-        masks.append(df["PWSID"].astype(str).str[:2].str.upper().eq("CA"))
-    if not masks:
-        return df
-    m = masks[0]
-    for mm in masks[1:]:
-        m = m | mm
-    return df[m]
+# ----------------------- Search (state-aware) -----------------------
 
-# ----------------------- Search (CA-only) -----------------------
-
-def search_by_name_ca(name_query: str, county_filter: str | None) -> pd.DataFrame:
-    q = name_query.strip()
-    tokens = re.findall(r"[A-Za-z0-9]+", q)
-    if not tokens:
+def search_by_name(state_code: str, name_query: str, county_filter: str | None) -> pd.DataFrame:
+    """
+    Generic search by STATE_CODE first, then optional name tokens and county.
+    - Pull WATER_SYSTEM filtered by STATE_CODE (server-side).
+    - If name is blank, return all systems for the state (optionally filter by county).
+    - If county given, fetch GEOGRAPHIC_AREA per-candidate PWSID to match county (no STATE_SERVED dependency).
+    """
+    sc = (state_code or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", sc):
         return pd.DataFrame()
 
-    # 1) WATER_SYSTEM: server-side filter to California
-    ws_all = pull_rows_filtered("WATER_SYSTEM", "STATE_CODE", "CA")
-    print(f"[DEBUG] Pulled WATER_SYSTEM (CA only): {len(ws_all)}")
+    q = (name_query or "").strip()
+    tokens = re.findall(r"[A-Za-z0-9]+", q) if q else []
 
-    if ws_all.empty or "PWS_NAME" not in ws_all.columns or "PWSID" not in ws_all.columns:
+    # 1) WATER_SYSTEM filtered by state
+    ws = pull_rows_filtered("WATER_SYSTEM", "STATE_CODE", sc)
+    print(f"[DEBUG] Pulled WATER_SYSTEM ({sc}): {len(ws)}")
+    if ws.empty or "PWSID" not in ws.columns or "PWS_NAME" not in ws.columns:
         return pd.DataFrame()
 
-    # 2) Name token match on WS
-    name_mask = token_and_contains(ws_all["PWS_NAME"], tokens)
-    cand_ws = ws_all[name_mask][["PWSID", "PWS_NAME"]].drop_duplicates("PWSID")
-    print(f"[DEBUG] Name token matches (WS): {len(cand_ws)}")
-    if cand_ws.empty:
-        return pd.DataFrame()
+    # 2) Name filtering (optional)
+    if tokens:
+        m = token_and_contains(ws["PWS_NAME"], tokens)
+        ws = ws[m]
+        print(f"[DEBUG] Name token matches ({sc}): {len(ws)}")
+        if ws.empty:
+            return pd.DataFrame()
 
-    # 3) No county filter? Return WS matches now (fast)
+    # If no county filter, return WS matches now
     if not county_filter:
-        return cand_ws.reset_index(drop=True)
+        show_cols = [c for c in ["PWSID", "PWS_NAME"] if c in ws.columns]
+        if not show_cols:
+            show_cols = ["PWSID"]
+        return ws[show_cols].drop_duplicates("PWSID").reset_index(drop=True)
 
-    # 4) County given → fetch GEOGRAPHIC_AREA per matched PWSID (no STATE_SERVED filter)
+    # 3) County filter given -> fetch GA per candidate (no STATE_SERVED filter)
     c = county_filter.strip().upper()
     rows = []
+    cand_ws = ws[["PWSID", "PWS_NAME"]].drop_duplicates("PWSID")
     for _, r in cand_ws.iterrows():
         pwsid = r["PWSID"]
-        ga_df = fetch_table_by_pwsid("GEOGRAPHIC_AREA", pwsid)  # exact PWSID call
+        ga_df = fetch_table_by_pwsid("GEOGRAPHIC_AREA", pwsid)
         ga_df = df_upper(ga_df)
-        county = ""
-        city = ""
+        county = next((str(x).strip() for x in ga_df.get("COUNTY_SERVED", pd.Series()).dropna().astype(str) if x.strip()), "")
+        city   = next((str(x).strip() for x in ga_df.get("CITY_SERVED",   pd.Series()).dropna().astype(str) if x.strip()), "")
+        if county and c in county.upper():
+            rows.append({"PWSID": pwsid, "PWS_NAME": r["PWS_NAME"], "CITY_SERVED": city, "COUNTY_SERVED": county})
 
-        if not ga_df.empty:
-            if "COUNTY_SERVED" in ga_df.columns:
-                # first non-empty county
-                for x in ga_df["COUNTY_SERVED"]:
-                    if pd.notna(x) and str(x).strip():
-                        county = str(x).strip()
-                        break
-            if "CITY_SERVED" in ga_df.columns:
-                for x in ga_df["CITY_SERVED"]:
-                    if pd.notna(x) and str(x).strip():
-                        city = str(x).strip()
-                        break
-
-        # allow partial match (e.g., "Tulare")
-        if county and re.search(re.escape(c), county, flags=re.IGNORECASE):
-            rows.append({
-                "PWSID": pwsid,
-                "PWS_NAME": r["PWS_NAME"],
-                "CITY_SERVED": city,
-                "COUNTY_SERVED": county
-            })
-
-    print(f"[DEBUG] After county filter={c}: {len(rows)} (from {len(cand_ws)})")
-
-    # If no rows matched county (often because GA county missing), fall back to WS matches
     if not rows:
+        # Soft fallback: name/state matches even if county missing
         return cand_ws.reset_index(drop=True)
 
-    out = pd.DataFrame(rows).drop_duplicates("PWSID").sort_values(["COUNTY_SERVED","PWS_NAME"])
+    out = pd.DataFrame(rows).drop_duplicates("PWSID").sort_values(["COUNTY_SERVED", "PWS_NAME"])
     return out.reset_index(drop=True)
+
+# Backward-compat convenience for CA-only callers (optional)
+def search_by_name_ca(name_query: str, county_filter: str | None) -> pd.DataFrame:
+    return search_by_name("CA", name_query, county_filter)
 
 # ----------------------- Fetch tables & report -----------------------
 
@@ -259,16 +240,18 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         sys.exit(1)
 
     doc = Document()
-    doc.add_heading(f"SDWIS Report (California) — {pwsid}", level=0)
+    doc.add_heading(f"SDWIS Report — {pwsid}", level=0)
 
     ws = data.get("WATER_SYSTEM", pd.DataFrame())
     ga = data.get("GEOGRAPHIC_AREA", pd.DataFrame())
     ws_name = ws.iloc[0]["PWS_NAME"] if not ws.empty and "PWS_NAME" in ws.columns else "N/A"
     county = ga.iloc[0]["COUNTY_SERVED"] if not ga.empty and "COUNTY_SERVED" in ga.columns else "N/A"
     city = ga.iloc[0]["CITY_SERVED"] if not ga.empty and "CITY_SERVED" in ga.columns else "N/A"
+    state = ws.iloc[0]["STATE_CODE"] if not ws.empty and "STATE_CODE" in ws.columns else (pwsid[:2] if isinstance(pwsid, str) else "N/A")
 
     doc.add_paragraph(f"Water System Name: {ws_name}")
     doc.add_paragraph(f"PWSID: {pwsid}")
+    doc.add_paragraph(f"State: {state}")
     doc.add_paragraph(f"County Served: {county}")
     doc.add_paragraph(f"City Served: {city}")
 
@@ -296,29 +279,33 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     print(f"Report saved: {out_path}")
     return out_path
 
-# ----------------------- Main -----------------------
+# ----------------------- Main (state-agnostic CLI) -----------------------
 
 def main():
-    print("SDWIS Finder (California-only)")
+    print("SDWIS Finder (state-aware)")
     print("  • Enter a PWSID (e.g., CA1010016), OR")
-    print("  • Enter words from the WATER SYSTEM NAME (partial, case-insensitive)")
-    query = input("\nSearch: ").strip()
+    print("  • Enter a 2-letter STATE code (e.g., CA), then (optional) name tokens and/or county")
+    query = input("\nSearch (PWSID or STATE code): ").strip()
 
     if looks_like_pwsid(query):
         pwsid = query.upper()
-        if not pwsid.startswith("CA"):
-            print("This script is limited to California (PWSIDs starting with 'CA').")
-            sys.exit(0)
     else:
-        county_hint = input("Optional COUNTY name (e.g., Tulare) [Enter to skip]: ").strip() or None
-        print("\nSearching by water system name in California…")
-        matches = search_by_name_ca(query, county_filter=county_hint)
+        sc = query.strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", sc):
+            print("Please enter a valid PWSID or a 2-letter state code (e.g., CA, TX, NY).")
+            sys.exit(0)
+
+        name = input("Water system name (optional): ").strip()
+        county_hint = input("County (optional): ").strip() or None
+        print(f"\nSearching {sc}…")
+        matches = search_by_name(sc, name_query=name, county_filter=county_hint)
         if matches.empty:
             print("No matches found. Try different words or adjust county filter.")
             sys.exit(0)
 
         # Show matches
-        display = matches.reset_index().rename(columns={"index": "#"})
+        display = matches.reset_index(drop=True)
+        display = display.reset_index().rename(columns={"index": "#"})
         print("\nMatches:")
         print(display.to_string(index=False))
 
@@ -332,11 +319,6 @@ def main():
 
     print(f"\nFetching selected fields for PWSID: {pwsid}")
     all_data = fetch_all_selected(pwsid)
-
-    # Save CSV snapshot too (optional)
-    # with pd.ExcelWriter(f"{pwsid}_tables.xlsx") as xw:
-    #     for tab, df in all_data.items():
-    #         df.to_excel(xw, sheet_name=tab[:31], index=False)
 
     if not HAVE_DOCX:
         print("Skipping Word report because python-docx is not installed.")
