@@ -1,0 +1,5 @@
+streamlit>=1.37
+python-docx>=1.1
+requests>=2.31
+pandas>=2.1
+urllib3>=2.0
