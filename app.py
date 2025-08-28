@@ -1,10 +1,8 @@
-# app.py — All states, fast county/city listing with bulk GA + caching
-# Runs a Streamlit UI that:
-#  - Filters WATER_SYSTEM by state (server-side), caching the result
-#  - Pulls GEOGRAPHIC_AREA once (bulk), caching the result
-#  - Matches county/city against WS.CITY_NAME (primary) or GA.CITY_SERVED (fallback)
-#  - Joins locally for speed; supports blank name + county/city listing
-#  - Lets users select a system directly from the table and generates a Word report
+# app.py — All states, fast county/city listing with lazy GA fetch + caching
+# - Filters WATER_SYSTEM by state (server-side), caching the result
+# - Fetches GEOGRAPHIC_AREA per PWSID on-demand (cached), instead of bulk-pulling the whole table
+# - Matches county/city against WS.CITY_NAME (primary) or GA.CITY_SERVED/COUNTY_SERVED (fallback)
+# - Lets users select a system directly from the table and generates a Word report
 
 import os
 import re
@@ -17,9 +15,9 @@ from sdwis_ca_report import (
     generate_report,
     fetch_all_selected,
     pull_rows_filtered,
-    pull_rows_paged,
     df_upper,
     token_and_contains,
+    fetch_table_by_pwsid,  # <-- needed for per-PWSID GA fetch
 )
 
 st.set_page_config(page_title="SDWIS – Report Generator (All States)", layout="centered")
@@ -42,38 +40,34 @@ def get_ws_by_state(state: str) -> pd.DataFrame:
     keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
     return ws[keep].drop_duplicates("PWSID") if keep else ws
 
-@st.cache_data(ttl=60*60*12)  # 12 hours
-def get_ga_all() -> pd.DataFrame:
-    """Fetch GEOGRAPHIC_AREA once; filter-by-state via PWSID prefix locally."""
-    ga = pull_rows_paged("GEOGRAPHIC_AREA")
-    ga = df_upper(ga)
-    keep_candidates = ["PWSID", "CITY_SERVED", "COUNTY_SERVED", "STATE_SERVED"]
-    keep = [c for c in keep_candidates if c in ga.columns]
-    ga = ga[keep] if keep else ga
-    subset = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
-    return ga.drop_duplicates(subset=subset) if subset else ga.drop_duplicates()
+@st.cache_data(ttl=60*60*12, max_entries=5000)
+def cached_ga_by_pwsid(pwsid: str) -> pd.DataFrame:
+    """
+    Fetch GEOGRAPHIC_AREA for a single PWSID and cache it.
+    Returns an uppercase-column DataFrame (may be empty).
+    """
+    df = fetch_table_by_pwsid("GEOGRAPHIC_AREA", pwsid)
+    return df_upper(df)
 
 @st.cache_data(ttl=60*60*12, max_entries=300)
 def cached_fetch_all_selected(pwsid: str):
     return fetch_all_selected(pwsid)
 
-# ---------------- Fast search (bulk GA + local join) ----------------
+# ---------------- Fast search (lazy GA fetch) ----------------
 
-def fast_search(state: str, name_query: str, county_or_city: str) -> pd.DataFrame:
+def fast_search(state: str, name_query: str, county_or_city: str, max_ga_candidates: int = 300) -> pd.DataFrame:
     """
-    - Start from WS filtered by state (cached), which includes CITY_NAME when present.
+    - Start from WS filtered by state (cached), includes CITY_NAME when present.
     - Optionally AND-filter by name tokens.
-    - If county_or_city provided, match against:
-        * WS.CITY_NAME, and/or
-        * GA (filtered by state): COUNTY_SERVED or CITY_SERVED
-      Take the union of PWSIDs from those matches, then join GA for display.
+    - If county_or_city provided:
+        * WS city filter via CITY_NAME (no GA calls)
+        * GA county/city filter by lazily fetching GA only for a capped set of candidate PWSIDs
+      Take the union of PWSIDs from both paths, merge GA fields if present, and display.
     """
     sc = (state or "").strip().upper()
     ws = get_ws_by_state(sc)   # PWSID, PWS_NAME, (maybe) CITY_NAME
-    ga = get_ga_all()
-
-    # Restrict GA to this state by PWSID prefix (robust even if STATE_SERVED missing)
-    ga_state = ga[ga["PWSID"].astype(str).str.startswith(sc)] if "PWSID" in ga.columns else ga.iloc[0:0]
+    if ws.empty:
+        return ws
 
     # Name filter (optional; AND across tokens)
     q = (name_query or "").strip()
@@ -93,29 +87,44 @@ def fast_search(state: str, name_query: str, county_or_city: str) -> pd.DataFram
             display_cols = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in out.columns]
         return out[display_cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
-    # County/City filter provided → match across both sources
+    # County/City filter provided
     term = (county_or_city or "").strip().lower()
 
-    # (A) WS.CITY_NAME contains
+    # (A) WS city matches via CITY_NAME (fast, no GA)
     if "CITY_NAME" in ws.columns:
         ws_city_mask = ws["CITY_NAME"].astype(str).str.lower().str.contains(term, na=False)
-        ws_city_match = ws.loc[ws_city_mask, ["PWSID"]]
+        ws_city_match = set(ws.loc[ws_city_mask, "PWSID"])
     else:
-        ws_city_match = pd.DataFrame(columns=["PWSID"])
+        ws_city_match = set()
 
-    # (B) GA.COUNTY_SERVED or GA.CITY_SERVED contains
-    m_county = ga_state["COUNTY_SERVED"].astype(str).str.lower().str.contains(term, na=False) if "COUNTY_SERVED" in ga_state.columns else False
-    m_city_sv = ga_state["CITY_SERVED"].astype(str).str.lower().str.contains(term, na=False)   if "CITY_SERVED"   in ga_state.columns else False
-    ga_match = ga_state[m_county | m_city_sv]
-    ga_match = ga_match[["PWSID", "CITY_SERVED", "COUNTY_SERVED"]] if not ga_match.empty else ga_match
+    # (B) GA matches via COUNTY_SERVED or CITY_SERVED — lazy, per-PWSID, capped
+    # Candidates for GA fetch: already name-filtered WS
+    candidates = ws["PWSID"].tolist()
 
-    # Union of PWSIDs
-    pwsids_from_ws_city = set(ws_city_match["PWSID"]) if "PWSID" in ws_city_match.columns else set()
-    pwsids_from_ga      = set(ga_match["PWSID"])      if "PWSID" in ga_match.columns else set()
-    pwsid_union = pwsids_from_ws_city | pwsids_from_ga
+    too_many = False
+    if len(candidates) > max_ga_candidates:
+        # If the user gave no name, we cap GA calls to keep things fast
+        too_many = True
+        candidates = candidates[:max_ga_candidates]
 
+    ga_rows = []
+    for pid in candidates:
+        ga_df = cached_ga_by_pwsid(pid)
+        if ga_df.empty:
+            continue
+        # Keep first non-empty city/county (some systems have multiple rows)
+        county = next((str(x).strip() for x in ga_df.get("COUNTY_SERVED", pd.Series()).dropna().astype(str) if x.strip()), "")
+        citysv = next((str(x).strip() for x in ga_df.get("CITY_SERVED",   pd.Series()).dropna().astype(str) if x.strip()), "")
+        if (county and term in county.lower()) or (citysv and term in citysv.lower()):
+            ga_rows.append({"PWSID": pid, "CITY_SERVED": citysv, "COUNTY_SERVED": county})
+
+    ga_match = pd.DataFrame(ga_rows) if ga_rows else pd.DataFrame(columns=["PWSID","CITY_SERVED","COUNTY_SERVED"])
+    pwsids_from_ga = set(ga_match["PWSID"]) if not ga_match.empty else set()
+
+    # Union of PWSIDs from both paths
+    pwsid_union = ws_city_match | pwsids_from_ga
     if not pwsid_union:
-        # Nothing matched city/county; fall back to name-only matches
+        # Nothing matched in GA or WS city; fall back to name-only matches
         out = ws.copy()
         if "CITY_NAME" in out.columns:
             out["CITY"] = out["CITY_NAME"].fillna("").astype(str).str.strip()
@@ -144,16 +153,20 @@ def fast_search(state: str, name_query: str, county_or_city: str) -> pd.DataFram
     if not display_cols:
         display_cols = [c for c in ["PWSID", "PWS_NAME"] if c in ws_union.columns]
     out = ws_union[display_cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
+
+    # Gentle note if we capped GA calls
+    if too_many:
+        st.info(f"Showing county/city matches from the first {max_ga_candidates} candidates for speed. Add a name or city to narrow further.")
+
     return out
 
 # ---------------- UI ----------------
 
 state = st.selectbox("State", STATES, index=STATES.index("AK") if "AK" in STATES else 0)
 
-# Warm caches so first search shows a spinner once
-with st.spinner(f"Loading data for {state}… (first time may take a few seconds)"):
+# Warm WS cache (fast); GA is now lazy per PWSID
+with st.spinner(f"Loading water systems for {state}… (first time may take a few seconds)"):
     _ = get_ws_by_state(state)
-    _ = get_ga_all()
 
 mode = st.radio("Lookup by", ["PWSID", "Name / County or City"], horizontal=True)
 pwsid = None
@@ -182,7 +195,7 @@ else:
                 st.warning("Enter a system name, OR a county/city.")
             else:
                 with st.spinner(f"Searching {state} systems…"):
-                    matches = fast_search(state, name, county_city or None)
+                    matches = fast_search(state, name, county_city or "")
                 st.session_state.matches = None if matches.empty else matches.reset_index(drop=True)
 
     # --- Show results only if we have them ---
@@ -190,12 +203,8 @@ else:
         st.subheader("Matches")
 
         # Build a working copy with columns to display
-        show_cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "CITY_SERVED", "COUNTY_SERVED"] if c in st.session_state.matches.columns]
+        show_cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in st.session_state.matches.columns]
         df = st.session_state.matches[show_cols].copy()
-
-        # Normalize CITY column for display if only CITY_SERVED exists
-        if "CITY" not in df.columns and "CITY_SERVED" in df.columns:
-            df.insert(df.columns.get_loc("CITY_SERVED"), "CITY", df["CITY_SERVED"])
 
         # --- Quick local filter (token AND across all visible text columns) ---
         st.write("Tip: filter by PWSID, name, city, or county. You can type multiple words (e.g., `los angeles water`).")
@@ -232,7 +241,6 @@ else:
                 "PWSID": st.column_config.TextColumn("PWSID"),
                 "PWS_NAME": st.column_config.TextColumn("Water System"),
                 "CITY": st.column_config.TextColumn("City"),
-                "CITY_SERVED": st.column_config.TextColumn("City (GA)"),
                 "COUNTY_SERVED": st.column_config.TextColumn("County"),
             },
             key="matches_editor",
