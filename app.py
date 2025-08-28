@@ -4,7 +4,7 @@
 #  - Pulls GEOGRAPHIC_AREA once (bulk), caching the result
 #  - Matches county/city against WS.CITY_NAME (primary) or GA.CITY_SERVED (fallback)
 #  - Joins locally for speed; supports blank name + county/city listing
-#  - Generates a Word report for a selected PWSID
+#  - Lets users select a system directly from the table and generates a Word report
 
 import os
 import re
@@ -47,7 +47,6 @@ def get_ga_all() -> pd.DataFrame:
     """Fetch GEOGRAPHIC_AREA once; filter-by-state via PWSID prefix locally."""
     ga = pull_rows_paged("GEOGRAPHIC_AREA")
     ga = df_upper(ga)
-    # GA typically has CITY_SERVED/COUNTY_SERVED (not CITY_NAME)
     keep_candidates = ["PWSID", "CITY_SERVED", "COUNTY_SERVED", "STATE_SERVED"]
     keep = [c for c in keep_candidates if c in ga.columns]
     ga = ga[keep] if keep else ga
@@ -60,7 +59,7 @@ def cached_fetch_all_selected(pwsid: str):
 
 # ---------------- Fast search (bulk GA + local join) ----------------
 
-def fast_search(state: str, name_query: str, county_or_city: str | None) -> pd.DataFrame:
+def fast_search(state: str, name_query: str, county_or_city: str) -> pd.DataFrame:
     """
     - Start from WS filtered by state (cached), which includes CITY_NAME when present.
     - Optionally AND-filter by name tokens.
@@ -78,14 +77,14 @@ def fast_search(state: str, name_query: str, county_or_city: str | None) -> pd.D
 
     # Name filter (optional; AND across tokens)
     q = (name_query or "").strip()
-    if q:
+    if q and "PWS_NAME" in ws.columns:
         tokens = re.findall(r"[A-Za-z0-9]+", q)
-        if tokens and "PWS_NAME" in ws.columns:
+        if tokens:
             m = token_and_contains(ws["PWS_NAME"], tokens)
             ws = ws[m]
 
     # If no county/city filter: return WS matches with a CITY column from CITY_NAME (if available)
-    if not county_or_city:
+    if not (county_or_city or "").strip():
         out = ws.copy()
         if "CITY_NAME" in out.columns:
             out["CITY"] = out["CITY_NAME"].fillna("").astype(str).str.strip()
@@ -95,7 +94,7 @@ def fast_search(state: str, name_query: str, county_or_city: str | None) -> pd.D
         return out[display_cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
     # County/City filter provided → match across both sources
-    term = county_or_city.strip().lower()
+    term = (county_or_city or "").strip().lower()
 
     # (A) WS.CITY_NAME contains
     if "CITY_NAME" in ws.columns:
@@ -186,21 +185,69 @@ else:
                     matches = fast_search(state, name, county_city or None)
                 st.session_state.matches = None if matches.empty else matches.reset_index(drop=True)
 
+    # --- Show results only if we have them ---
     if st.session_state.matches is not None:
         st.subheader("Matches")
-        display_cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in st.session_state.matches.columns]
-        if not display_cols:
-            display_cols = [c for c in ["PWSID", "PWS_NAME"] if c in st.session_state.matches.columns]
-        st.dataframe(st.session_state.matches[display_cols], use_container_width=True)
 
-        idx = st.selectbox(
-            "Pick a system",
-            list(range(len(st.session_state.matches))),
-            format_func=lambda i: f"{st.session_state.matches.iloc[i]['PWSID']} — {st.session_state.matches.iloc[i].get('PWS_NAME','')}"
+        # Build a working copy with columns to display
+        show_cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "CITY_SERVED", "COUNTY_SERVED"] if c in st.session_state.matches.columns]
+        df = st.session_state.matches[show_cols].copy()
+
+        # Normalize CITY column for display if only CITY_SERVED exists
+        if "CITY" not in df.columns and "CITY_SERVED" in df.columns:
+            df.insert(df.columns.get_loc("CITY_SERVED"), "CITY", df["CITY_SERVED"])
+
+        # --- Quick local filter (token AND across all visible text columns) ---
+        st.write("Tip: filter by PWSID, name, city, or county. You can type multiple words (e.g., `los angeles water`).")
+        q = st.text_input("Filter rows", key="quick_filter").strip()
+        if q:
+            tokens = [t for t in re.findall(r"[A-Za-z0-9]+", q) if t]
+            if tokens:
+                hay = df.fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+                m = pd.Series(True, index=df.index)
+                for t in tokens:
+                    m &= hay.str.contains(re.escape(t.lower()), na=False)
+                df = df[m]
+
+        st.caption(f"{len(df):,} systems shown")
+
+        # Add a checkbox column for selecting exactly one row
+        if "Select" not in df.columns:
+            df.insert(0, "Select", False)
+
+        disabled_cols = [c for c in df.columns if c != "Select"]
+
+        edited = st.data_editor(
+            df,
+            hide_index=True,
+            use_container_width=True,
+            height=420,
+            disabled=disabled_cols,
+            column_config={
+                "Select": st.column_config.CheckboxColumn(
+                    label="Select",
+                    help="Tick one row to generate a report",
+                    default=False,
+                ),
+                "PWSID": st.column_config.TextColumn("PWSID"),
+                "PWS_NAME": st.column_config.TextColumn("Water System"),
+                "CITY": st.column_config.TextColumn("City"),
+                "CITY_SERVED": st.column_config.TextColumn("City (GA)"),
+                "COUNTY_SERVED": st.column_config.TextColumn("County"),
+            },
+            key="matches_editor",
         )
+
+        # Enforce single-selection and trigger report
+        selected_rows = edited[edited["Select"] == True]
         with col2:
-            if st.button("Generate report"):
-                pwsid = st.session_state.matches.iloc[idx]["PWSID"]
+            if st.button("Generate report for selected"):
+                if len(selected_rows) == 0:
+                    st.error("Select one row first.")
+                elif len(selected_rows) > 1:
+                    st.error("Only one row can be selected.")
+                else:
+                    pwsid = str(selected_rows.iloc[0]["PWSID"])
 
 # ---------------- Report ----------------
 
