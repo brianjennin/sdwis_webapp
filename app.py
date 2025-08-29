@@ -1,5 +1,4 @@
-# app.py — All states, fast county/city listing with bulk GA + caching
-# Multi-select: generate multiple separate Word docs + one ZIP download
+# app.py — All states, fast search with state-scoped GA + multi-select ZIP
 
 import os
 import re
@@ -14,14 +13,13 @@ from sdwis_ca_report import (
     generate_report,
     fetch_all_selected,
     pull_rows_filtered,
-    pull_rows_paged,
     df_upper,
     token_and_contains,
 )
 
 st.set_page_config(page_title="SDWIS – Report Generator (All States)", layout="centered")
 st.title("SDWIS – Report Generator (All States)")
-st.write("Pick a state, optionally add a name and/or county/city, or enter a PWSID. Download a Word report.")
+st.write("Pick a state, optionally add a name and/or county/city, or enter a PWSID. Download one or many Word reports.")
 
 STATES = [
     "AL","AK","AZ","AR","CA","CO","CT","DC","DE","FL","GA","HI","IA","ID","IL","IN","KS","KY",
@@ -31,21 +29,24 @@ STATES = [
 
 # ---------------- Caching ----------------
 
-@st.cache_data(ttl=60*60*12)  # 12 hours
+@st.cache_data(ttl=60*60*12)  # 12h
 def get_ws_by_state(state: str) -> pd.DataFrame:
-    """Server-side filter WATER_SYSTEM by STATE_CODE; keep CITY_NAME (primary city)."""
+    """WATER_SYSTEM filtered server-side by STATE_CODE; keep city_name when present."""
     ws = pull_rows_filtered("WATER_SYSTEM", "STATE_CODE", (state or "").upper())
     ws = df_upper(ws)
     keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
     return ws[keep].drop_duplicates("PWSID") if keep else ws
 
-@st.cache_data(ttl=60*60*12)  # 12 hours
-def get_ga_all() -> pd.DataFrame:
-    """Fetch GEOGRAPHIC_AREA once; filter-by-state via PWSID prefix locally."""
-    ga = pull_rows_paged("GEOGRAPHIC_AREA")
+@st.cache_data(ttl=60*60*12)  # 12h
+def get_ga_by_state(state: str) -> pd.DataFrame:
+    """
+    GEOGRAPHIC_AREA filtered server-side by STATE_SERVED for the chosen state.
+    This is MUCH smaller than pulling the entire GA table.
+    Note: some systems lack STATE_SERVED; we’ll still show CITY from WS if available.
+    """
+    ga = pull_rows_filtered("GEOGRAPHIC_AREA", "STATE_SERVED", (state or "").upper())
     ga = df_upper(ga)
-    keep_candidates = ["PWSID", "CITY_SERVED", "COUNTY_SERVED", "STATE_SERVED"]
-    keep = [c for c in keep_candidates if c in ga.columns]
+    keep = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED", "STATE_SERVED"] if c in ga.columns]
     ga = ga[keep] if keep else ga
     subset = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
     return ga.drop_duplicates(subset=subset) if subset else ga.drop_duplicates()
@@ -54,107 +55,69 @@ def get_ga_all() -> pd.DataFrame:
 def cached_fetch_all_selected(pwsid: str):
     return fetch_all_selected(pwsid)
 
-# ---------------- Fast search (bulk GA + local join) ----------------
+# ---------------- Fast search (state-scoped GA) ----------------
 
 def fast_search(state: str, name_query: str, county_or_city: str | None) -> pd.DataFrame:
     """
-    - Start from WS filtered by state (cached), which includes CITY_NAME when present.
-    - Optionally AND-filter by name tokens.
-    - If county_or_city provided, match against:
-        * WS.CITY_NAME, and/or
-        * GA (filtered by state): COUNTY_SERVED or CITY_SERVED
-      Take the union of PWSIDs from those matches, then join GA for display.
+    - WS filtered by state (cached).
+    - Optional name tokens (AND).
+    - GA filtered by STATE_SERVED == state (cached on demand).
+    - City shown from WS.CITY_NAME when present; county/city from GA else blank.
     """
     sc = (state or "").strip().upper()
-    ws = get_ws_by_state(sc)   # PWSID, PWS_NAME, (maybe) CITY_NAME
-    ga = get_ga_all()
+    ws = get_ws_by_state(sc)  # PWSID, PWS_NAME, (maybe) CITY_NAME
 
-    # Restrict GA to this state by PWSID prefix (robust even if STATE_SERVED missing)
-    ga_state = ga[ga["PWSID"].astype(str).str.startswith(sc)] if "PWSID" in ga.columns else ga.iloc[0:0]
-
-    # Name filter (optional; AND across tokens)
+    # Name filter (optional; AND)
     q = (name_query or "").strip()
-    if q:
+    if q and "PWS_NAME" in ws.columns:
         tokens = re.findall(r"[A-Za-z0-9]+", q)
-        if tokens and "PWS_NAME" in ws.columns:
-            m = token_and_contains(ws["PWS_NAME"], tokens)
-            ws = ws[m]
+        if tokens:
+            ws = ws[token_and_contains(ws["PWS_NAME"], tokens)]
 
-    # If no county/city filter: return WS matches with a CITY column from CITY_NAME (if available)
+    # Start building output with CITY from WS
+    out = ws.copy()
+    if "CITY_NAME" in out.columns:
+        out["CITY"] = out["CITY_NAME"].fillna("").astype(str).str.strip()
+
+    # If no county/city filter, just return WS view
     if not county_or_city:
-        out = ws.copy()
-        if "CITY_NAME" in out.columns:
-            out["CITY"] = out["CITY_NAME"].fillna("").astype(str).str.strip()
-        display_cols = [c for c in ["PWSID", "PWS_NAME", "CITY"] if c in out.columns]
-        if not display_cols:
-            display_cols = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in out.columns]
-        return out[display_cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
+        show = [c for c in ["PWSID", "PWS_NAME", "CITY"] if c in out.columns]
+        if not show:
+            show = [c for c in ["PWSID", "PWS_NAME"] if c in out.columns]
+        return out[show].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
-    # County/City filter provided → match across both sources
-    term = county_or_city.strip().lower()
-
-    # (A) WS.CITY_NAME contains
-    if "CITY_NAME" in ws.columns:
-        ws_city_mask = ws["CITY_NAME"].astype(str).str.lower().str.contains(term, na=False)
-        ws_city_match = ws.loc[ws_city_mask, ["PWSID"]]
-    else:
-        ws_city_match = pd.DataFrame(columns=["PWSID"])
-
-    # (B) GA.COUNTY_SERVED or GA.CITY_SERVED contains
-    m_county = ga_state["COUNTY_SERVED"].astype(str).str.lower().str.contains(term, na=False) if "COUNTY_SERVED" in ga_state.columns else False
-    m_city_sv = ga_state["CITY_SERVED"].astype(str).str.lower().str.contains(term, na=False)   if "CITY_SERVED"   in ga_state.columns else False
-    ga_match = ga_state[m_county | m_city_sv]
-    ga_match = ga_match[["PWSID", "CITY_SERVED", "COUNTY_SERVED"]] if not ga_match.empty else ga_match
-
-    # Union of PWSIDs
-    pwsids_from_ws_city = set(ws_city_match["PWSID"]) if "PWSID" in ws_city_match.columns else set()
-    pwsids_from_ga      = set(ga_match["PWSID"])      if "PWSID" in ga_match.columns else set()
-    pwsid_union = pwsids_from_ws_city | pwsids_from_ga
-
-    if not pwsid_union:
-        # Nothing matched city/county; fall back to name-only matches
-        out = ws.copy()
-        if "CITY_NAME" in out.columns:
-            out["CITY"] = out["CITY_NAME"].fillna("").astype(str).str.strip()
-        cols = [c for c in ["PWSID", "PWS_NAME", "CITY"] if c in out.columns]
-        if not cols:
-            cols = [c for c in ["PWSID", "PWS_NAME"] if c in out.columns]
-        return out[cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
-
-    # Keep only WS rows whose PWSID is in the union
-    ws_union = ws[ws["PWSID"].isin(pwsid_union)] if "PWSID" in ws.columns else ws.copy()
-
-    # Merge GA info if available (for COUNTY_SERVED / fallback city)
-    if not ga_match.empty and "PWSID" in ga_match.columns:
-        ws_union = ws_union.merge(ga_match, on="PWSID", how="left")
-
-    # Build unified CITY column: prefer WS.CITY_NAME, else GA.CITY_SERVED
-    if "CITY" not in ws_union.columns:
-        ws_union["CITY"] = ""
-    if "CITY_NAME" in ws_union.columns:
-        ws_union["CITY"] = ws_union["CITY"].mask(ws_union["CITY"].eq(""), ws_union["CITY_NAME"].fillna("").astype(str).str.strip())
-    if "CITY_SERVED" in ws_union.columns:
-        ws_union["CITY"] = ws_union["CITY"].mask(ws_union["CITY"].eq(""), ws_union["CITY_SERVED"].fillna("").astype(str).str.strip())
-
-    # Prepare output
-    display_cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in ws_union.columns]
-    if not display_cols:
-        display_cols = [c for c in ["PWSID", "PWS_NAME"] if c in ws_union.columns]
-    out = ws_union[display_cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
-    return out
+    # County/city filter → fetch GA for this state (small) and match
+    ga = get_ga_by_state(sc)
+    if not ga.empty and "PWSID" in ga.columns:
+        term = county_or_city.strip().lower()
+        m_county = ga["COUNTY_SERVED"].astype(str).str.lower().str.contains(term, na=False) if "COUNTY_SERVED" in ga.columns else False
+        m_citysv = ga["CITY_SERVED"].astype(str).str.lower().str.contains(term, na=False)   if "CITY_SERVED"   in ga.columns else False
+        ga_match = ga[m_county | m_citysv]
+        merge_cols = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga_match.columns]
+        if merge_cols:
+            out = out.merge(ga_match[merge_cols], on="PWSID", how="inner")
+            # Fill CITY from GA if WS city was missing
+            if "CITY" not in out.columns:
+                out["CITY"] = ""
+            if "CITY_SERVED" in out.columns:
+                out["CITY"] = out["CITY"].mask(out["CITY"].eq(""), out["CITY_SERVED"].fillna("").astype(str).str.strip())
+    # Prepare final columns
+    show = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in out.columns]
+    if not show:
+        show = [c for c in ["PWSID", "PWS_NAME"] if c in out.columns]
+    return out[show].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
 # ---------------- UI ----------------
 
 state = st.selectbox("State", STATES, index=STATES.index("AK") if "AK" in STATES else 0)
 
-# Warm caches so first search shows a spinner once
-with st.spinner(f"Loading data for {state}… (first time may take a few seconds)"):
+# Warm only WS cache (fast). DO NOT warm GA here (that’s what caused the long initial load).
+with st.spinner(f"Loading water systems for {state}…"):
     _ = get_ws_by_state(state)
-    _ = get_ga_all()
 
 mode = st.radio("Lookup by", ["PWSID", "Name / County or City"], horizontal=True)
 
-# container to hold generated outputs in session (per run)
+# storage for generated output (multi-select path)
 if "generated_reports" not in st.session_state:
     st.session_state.generated_reports = None
 
@@ -185,22 +148,20 @@ else:
             with st.spinner(f"Searching {state} systems…"):
                 matches = fast_search(state, name, county_city or None)
             st.session_state.matches = None if matches.empty else matches.reset_index(drop=True)
-            # clear prior generated reports
-            st.session_state.generated_reports = None
+            st.session_state.generated_reports = None  # clear old outputs
 
-    # Show table with multi-select checkboxes
+    # Show table with multi-select
     if st.session_state.matches is not None:
         st.subheader("Matches")
-
         show_cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in st.session_state.matches.columns]
         df = st.session_state.matches[show_cols].copy()
 
-        # Add checkbox column for multi-select
+        # Add checkbox column
         if "Select" not in df.columns:
             df.insert(0, "Select", False)
 
-        # Optional quick filter across all visible text columns
-        st.write("Tip: filter by PWSID, name, city, or county. Multiple words are ANDed.")
+        # Quick local filter
+        st.write("Tip: filter by PWSID, name, city, or county (multiple words = AND).")
         q = st.text_input("Filter rows", key="quick_filter").strip()
         if q:
             tokens = [t for t in re.findall(r"[A-Za-z0-9]+", q) if t]
@@ -235,38 +196,35 @@ else:
         selected_rows = edited[edited["Select"] == True]
         st.caption(f"{len(selected_rows)} selected")
 
-        if st.button("Generate report(s) for selected"):
+        if st.button("Generate report(s) for selected)"):
             if len(selected_rows) == 0:
                 st.error("Select at least one system.")
             else:
-                # Generate multiple DOCX and keep in memory; also build a ZIP
                 gen_files: dict[str, bytes] = {}
                 with st.spinner("Generating reports…"):
                     for _, row in selected_rows.iterrows():
                         pid = str(row["PWSID"])
                         data = cached_fetch_all_selected(pid)
-                        # make a temp file for generate_report
                         tmpdir = tempfile.mkdtemp()
                         outpath = os.path.join(tmpdir, f"{pid}_SDWIS_Report.docx")
                         outpath = generate_report(pid, data, out_path=outpath)
                         with open(outpath, "rb") as f:
                             gen_files[os.path.basename(outpath)] = f.read()
 
-                # Build ZIP in memory
+                # bundle into a ZIP
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                     for fname, content in gen_files.items():
                         zf.writestr(fname, content)
                 zip_buf.seek(0)
 
-                # Store in session for download UI
                 st.session_state.generated_reports = {
                     "zip_bytes": zip_buf.getvalue(),
                     "files": gen_files,
                 }
                 st.success(f"Generated {len(gen_files)} report(s). See download options below.")
 
-# ---------------- Report (single PWSID path) ----------------
+# ---------------- Single-PWSID path ----------------
 
 if pwsid:
     with st.spinner(f"Fetching SDWIS data for {pwsid}…"):
@@ -284,13 +242,11 @@ if pwsid:
         )
     st.success("Report generated.")
 
-# ---------------- Downloads area for multi-select ----------------
+# ---------------- Multi-downloads ----------------
 
 if st.session_state.generated_reports:
     st.divider()
     st.subheader("Download your reports")
-
-    # ZIP download (all docs)
     st.download_button(
         "Download all as ZIP",
         data=st.session_state.generated_reports["zip_bytes"],
@@ -298,8 +254,6 @@ if st.session_state.generated_reports:
         mime="application/zip",
         key="zip_dl",
     )
-
-    # Optional: individual file buttons
     with st.expander("Download individual files"):
         for fname, content in st.session_state.generated_reports["files"].items():
             st.download_button(
