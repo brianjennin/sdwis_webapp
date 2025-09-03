@@ -454,7 +454,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         print("python-docx is not installed. Install it with: pip install python-docx")
         sys.exit(1)
 
-    # --- small helpers -------------------------------------------------------
+    # ---------------- helpers ----------------
     def u(df: pd.DataFrame) -> pd.DataFrame:
         return df_upper(df)
 
@@ -465,7 +465,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         return v if v else default
 
     def desc(col: str, val: str | None) -> str:
-        """Show 'CODE — Description' when mapping exists."""
+        """Show 'CODE — Description' when mapping exists; otherwise raw value."""
         if val is None or (isinstance(val, float) and pd.isna(val)):
             return "N/A"
         s = str(val).strip()
@@ -494,14 +494,14 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
             for j, v in enumerate(r):
                 cells[j].text = "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
 
-    # --- source tables --------------------------------------------------------
+    # ---------------- source tables ----------------
     ws  = u(data.get("WATER_SYSTEM", pd.DataFrame()))
     ga  = u(data.get("GEOGRAPHIC_AREA", pd.DataFrame()))
     wsf = u(data.get("WATER_SYSTEM_FACILITY", pd.DataFrame()))
     vio = u(data.get("VIOLATION", pd.DataFrame()))
-    trt = u(data.get("TREATMENT", pd.DataFrame()))  # requires TABLE_FIELDS entry
+    trt = u(data.get("TREATMENT", pd.DataFrame()))  # optional; used to enrich treatment rows
 
-    # --- summary block --------------------------------------------------------
+    # ---------------- summary ----------------
     ws_name     = get1(ws, "PWS_NAME")
     pws_type    = desc("PWS_TYPE_CODE", get1(ws, "PWS_TYPE_CODE"))
     pws_act     = desc("PWS_ACTIVITY_CODE", get1(ws, "PWS_ACTIVITY_CODE"))
@@ -514,7 +514,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     primary_src = desc("PRIMARY_SOURCE_CODE", get1(ws, "PRIMARY_SOURCE_CODE"))
     wholesaler  = yn_from(get1(ws, "IS_WHOLESALER_IND"))
 
-    # County Served: first non-empty GA row
+    # County Served: first non-empty in GA
     county = "N/A"
     if not ga.empty and "COUNTY_SERVED" in ga.columns:
         non_empty = ga["COUNTY_SERVED"].dropna().astype(str).str.strip()
@@ -531,24 +531,22 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     doc.add_paragraph(f"Population Served: {pop}    Service Connections: {svc_conn}")
     doc.add_paragraph(f"Primary Source: {primary_src}    Wholesale Supplier to Other PWS’s: {wholesaler}")
 
-    # ======================== Facilities =====================================
+    # ======================== Facilities ========================
     doc.add_heading("Facilities", level=1)
 
-    # -------- Sources (only IS_SOURCE_IND == 'Y'), sorted by type, activity, name
+    # -------- Sources: only IS_SOURCE_IND == 'Y'; sort by type, activity, name
     doc.add_paragraph("Sources")
     src_rows = []
-    if not wsf.empty:
-        wsf2 = wsf.copy()
+    if not wsf.empty and "IS_SOURCE_IND" in wsf.columns:
+        src_df = wsf.copy()
         for c in ("IS_SOURCE_IND","FACILITY_TYPE_CODE","FACILITY_ACTIVITY_CODE","FACILITY_NAME"):
-            if c in wsf2.columns:
-                wsf2[c] = wsf2[c].astype(str)
-        mask_src = wsf2["IS_SOURCE_IND"].str.upper().eq("Y") if "IS_SOURCE_IND" in wsf2.columns else pd.Series(False, index=wsf2.index)
-        src_df = wsf2[mask_src].copy() if "IS_SOURCE_IND" in wsf2.columns else pd.DataFrame()
+            if c in src_df.columns:
+                src_df[c] = src_df[c].astype(str)
+        src_df = src_df[src_df["IS_SOURCE_IND"].str.upper() == "Y"]
         if not src_df.empty:
-            # Sort: facility_type_code, facility_activity_code, facility_name
             sort_cols = [c for c in ["FACILITY_TYPE_CODE","FACILITY_ACTIVITY_CODE","FACILITY_NAME"] if c in src_df.columns]
             if sort_cols:
-                src_df = src_df.sort_values(sort_cols, kind="mergesort")  # stable sort
+                src_df = src_df.sort_values(sort_cols, kind="mergesort")
             for _, r in src_df.iterrows():
                 src_rows.append([
                     desc("FACILITY_TYPE_CODE", r.get("FACILITY_TYPE_CODE", "")),
@@ -566,26 +564,34 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-    # -------- Treatment (sort by facility_name)
+    # -------- Treatment: only FACILITY_TYPE_CODE == 'TP'; sort by facility_name
     doc.add_paragraph("")  # spacer
     doc.add_paragraph("Treatment")
     tr_rows = []
-    if not trt.empty:
-        fac_min = pd.DataFrame()
-        if not wsf.empty and "FACILITY_ID" in wsf.columns:
-            fac_min = wsf[["FACILITY_ID","FACILITY_NAME","STATE_FACILITY_ID","FACILITY_ACTIVITY_CODE"]].drop_duplicates("FACILITY_ID")
-        td = trt.merge(fac_min, on="FACILITY_ID", how="left") if not fac_min.empty else trt.copy()
-        if "FACILITY_NAME" in td.columns:
-            td = td.sort_values(["FACILITY_NAME"], kind="mergesort")
-        for _, r in td.iterrows():
-            tr_rows.append([
-                r.get("FACILITY_NAME", ""),
-                active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
-                r.get("FACILITY_ID", ""),
-                r.get("STATE_FACILITY_ID", ""),
-                desc("TREATMENT_OBJECTIVE_CODE", r.get("TREATMENT_OBJECTIVE_CODE", "")),
-                r.get("TREATMENT_PROCESS_CODE", ""),
-            ])
+    if not wsf.empty and "FACILITY_TYPE_CODE" in wsf.columns:
+        tp_df = wsf.copy()
+        for c in ("FACILITY_TYPE_CODE","FACILITY_NAME","FACILITY_ACTIVITY_CODE"):
+            if c in tp_df.columns:
+                tp_df[c] = tp_df[c].astype(str)
+        tp_df = tp_df[tp_df["FACILITY_TYPE_CODE"].str.upper() == "TP"]
+        if not tp_df.empty:
+            # enrich with TREATMENT (objective/process) if available
+            if not trt.empty and "FACILITY_ID" in trt.columns:
+                keep_t = [c for c in ["FACILITY_ID","TREATMENT_OBJECTIVE_CODE","TREATMENT_PROCESS_CODE"] if c in trt.columns]
+                t_min = trt[keep_t].drop_duplicates()
+                tp_df = tp_df.merge(t_min, on="FACILITY_ID", how="left")
+            # sort by facility_name
+            if "FACILITY_NAME" in tp_df.columns:
+                tp_df = tp_df.sort_values(["FACILITY_NAME"], kind="mergesort")
+            for _, r in tp_df.iterrows():
+                tr_rows.append([
+                    r.get("FACILITY_NAME", ""),
+                    active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
+                    r.get("FACILITY_ID", ""),
+                    r.get("STATE_FACILITY_ID", ""),
+                    desc("TREATMENT_OBJECTIVE_CODE", r.get("TREATMENT_OBJECTIVE_CODE", "")),
+                    r.get("TREATMENT_PROCESS_CODE", ""),
+                ])
     if tr_rows:
         add_table(doc,
                   headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID", "Treatment Objective", "Treatment Process"],
@@ -593,28 +599,21 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-    # -------- Storage (sort by facility_name)
+    # -------- Storage: simple detection for now; sort by facility_name
     doc.add_paragraph("")  # spacer
     doc.add_paragraph("Storage")
     stor_rows = []
-    if not wsf.empty:
-        df = wsf.copy()
-        for c in ("FACILITY_TYPE_CODE","FACILITY_NAME"):
-            if c in df.columns:
-                df[c] = df[c].astype(str)
-        # heuristic: treat anything with 'STORAGE' in type as storage
-        mask = df["FACILITY_TYPE_CODE"].str.contains("STORAGE", case=False, na=False) if "FACILITY_TYPE_CODE" in df.columns else pd.Series(False, index=df.index)
-        sd = df[mask].copy()
-        if not sd.empty:
-            if "FACILITY_NAME" in sd.columns:
-                sd = sd.sort_values(["FACILITY_NAME"], kind="mergesort")
-            for _, r in sd.iterrows():
-                stor_rows.append([
-                    r.get("FACILITY_NAME", ""),
-                    active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
-                    r.get("FACILITY_ID", ""),
-                    r.get("STATE_FACILITY_ID", ""),
-                ])
+    if not wsf.empty and "FACILITY_TYPE_CODE" in wsf.columns:
+        sd = wsf[wsf["FACILITY_TYPE_CODE"].astype(str).str.contains("STORAGE", case=False, na=False)].copy()
+        if not sd.empty and "FACILITY_NAME" in sd.columns:
+            sd = sd.sort_values(["FACILITY_NAME"], kind="mergesort")
+        for _, r in sd.iterrows():
+            stor_rows.append([
+                r.get("FACILITY_NAME", ""),
+                active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
+                r.get("FACILITY_ID", ""),
+                r.get("STATE_FACILITY_ID", ""),
+            ])
     if stor_rows:
         add_table(doc,
                   headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID"],
@@ -622,7 +621,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-    # ======================== Violations =====================================
+    # ======================== Violations ========================
     doc.add_heading("Violations", level=1)
 
     def vio_rows_from(df: pd.DataFrame) -> list[list[str]]:
@@ -635,12 +634,11 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
             ])
         return rows
 
-    # Health Based: only IS_HEALTH_BASED_IND == 'Y', sorted by category then code
+    # Health Based: only Y; sort by category then code
     doc.add_paragraph("Health Based")
     hb_rows = []
     if not vio.empty and "IS_HEALTH_BASED_IND" in vio.columns:
         hb = vio[vio["IS_HEALTH_BASED_IND"].astype(str).str.upper().eq("Y")].copy()
-        # sort by raw codes (not descriptions)
         sort_cols = [c for c in ["VIOLATION_CATEGORY_CODE","VIOLATION_CODE"] if c in hb.columns]
         if sort_cols:
             hb = hb.sort_values(sort_cols, kind="mergesort")
@@ -650,7 +648,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-    # Non-Health Based: only IS_HEALTH_BASED_IND == 'N', sorted by category then code
+    # Non-Health Based: only N; sort by category then code
     doc.add_paragraph("")  # spacer
     doc.add_paragraph("Non-Health Based")
     nh_rows = []
@@ -665,7 +663,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-    # --- write ----------------------------------------------------------------
+    # ---------------- save ----------------
     if out_path is None:
         out_path = f"{pwsid}_SDWIS_Report.docx"
     doc.save(out_path)
