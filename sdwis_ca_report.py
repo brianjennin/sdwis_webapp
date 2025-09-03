@@ -676,50 +676,51 @@ import os
 import tempfile
 import zipfile
 
-def generate_reports_zip(pwsids: list[str], out_zip: str | None = None) -> str:
+def generate_reports_zip(pwsids: list[str], fetch_data_fn, zip_name: str = "SDWIS_Reports.zip") -> str:
     """
-    Generate Word reports for multiple PWSIDs and package them into a ZIP.
+    Create multiple Word reports and bundle them into a ZIP.
 
     Parameters
     ----------
     pwsids : list[str]
-        List of PWSIDs (e.g., ["CA1010016", "CA1234567"])
-    out_zip : str | None
-        Optional path for the output ZIP file. If None, a temporary path is used.
+        PWSIDs to include.
+    fetch_data_fn : callable
+        Function that accepts (pwsid) -> dict[str, pd.DataFrame]
+        e.g., your cached_fetch_all_selected from app.py.
+    zip_name : str
+        Filename for the resulting zip (only the name; we'll place it in a temp dir).
 
     Returns
     -------
     str
-        Path to the created ZIP file.
+        Absolute path to the created ZIP file.
     """
     if not HAVE_DOCX:
         raise RuntimeError("python-docx is not installed. Install it with: pip install python-docx")
 
-    if out_zip is None:
-        out_zip = os.path.abspath("SDWIS_Reports.zip")
+    tmpdir = tempfile.mkdtemp()
+    report_paths: list[str] = []
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        report_paths = []
-        for pid in pwsids:
-            try:
-                print(f"Fetching data for {pid}…")
-                all_data = fetch_all_selected(pid)
-                out_path = os.path.join(tmpdir, f"{pid}_SDWIS_Report.docx")
-                generate_report(pid, all_data, out_path=out_path)
-                report_paths.append(out_path)
-            except Exception as e:
-                print(f"❌ Failed to generate report for {pid}: {e}")
+    # Build each DOCX
+    for pid in pwsids:
+        try:
+            data = fetch_data_fn(pid)
+            out_docx = os.path.join(tmpdir, f"{pid}_SDWIS_Report.docx")
+            generate_report(pid, data, out_path=out_docx)
+            report_paths.append(out_docx)
+        except Exception as e:
+            print(f"❌ Failed to generate report for {pid}: {e}")
 
-        if not report_paths:
-            raise RuntimeError("No reports generated, ZIP will not be created.")
+    if not report_paths:
+        raise RuntimeError("No reports generated; ZIP will not be created.")
 
-        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path in report_paths:
-                zf.write(path, arcname=os.path.basename(path))
+    # Bundle into ZIP (in the same temp dir)
+    zip_path = os.path.join(tmpdir, zip_name)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in report_paths:
+            zf.write(path, arcname=os.path.basename(path))
 
-    print(f"ZIP file created: {out_zip}")
-    return out_zip
-
+    return zip_path
 
 # ----------------------- Main (state-agnostic CLI) -----------------------
 
