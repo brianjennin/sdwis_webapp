@@ -8,6 +8,8 @@ import re
 import tempfile
 import pandas as pd
 import streamlit as st
+from sdwis_ca_report import generate_reports_zip
+
 
 from sdwis_ca_report import (
     looks_like_pwsid,
@@ -181,16 +183,29 @@ else:
             },
             key="matches_editor",
         )
-
         selected_rows = edited[edited["Select"] == True]
         with col2:
             if st.button("Generate report for selected"):
-                if len(selected_rows) == 0:
-                    st.error("Select one row first.")
-                elif len(selected_rows) > 1:
-                    st.error("Only one row can be selected.")
-                else:
+                num = len(selected_rows)
+                if num == 0:
+                    st.error("Select at least one row.")
+                elif num == 1:
+                    # Single selection → generate one DOCX
                     pwsid_to_generate = str(selected_rows.iloc[0]["PWSID"])
+                else:
+                    # Multiple selections → build ZIP
+                    pids = [str(x) for x in selected_rows["PWSID"].tolist()]
+                    with st.spinner(f"Building {num} reports…"):
+                        zip_path = generate_reports_zip(pids, cached_fetch_all_selected)
+                    with open(zip_path, "rb") as f:
+                        st.download_button(
+                            "Download ZIP of Word reports",
+                            data=f.read(),
+                            file_name="SDWIS_Reports.zip",
+                            mime="application/zip",
+                        )
+                    st.success(f"Created ZIP with {num} reports.")
+
 
 # ---------------- Report ----------------
 

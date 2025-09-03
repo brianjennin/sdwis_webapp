@@ -538,6 +538,33 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     print(f"Report saved: {out_path}")
     return out_path
 
+# --- Build multiple reports into a ZIP -------------------------------------
+import tempfile, os, zipfile
+
+def generate_reports_zip(pwsids: list[str], fetch_data_fn, zip_name: str = "SDWIS_Reports.zip") -> str:
+    """
+    Create multiple Word reports (one per PWSID) and bundle them into a ZIP.
+    - pwsids: list of PWSIDs to include
+    - fetch_data_fn: callable (pwsid) -> dict[str, pd.DataFrame]
+      (use your cached_fetch_all_selected from app.py)
+    - zip_name: filename for the resulting zip
+    Returns: absolute path to the created zip file
+    """
+    tmpdir = tempfile.mkdtemp()
+    doc_paths = []
+
+    for pid in pwsids:
+        data = fetch_data_fn(pid)
+        out_docx = os.path.join(tmpdir, f"{pid}_SDWIS_Report.docx")
+        generate_report(pid, data, out_path=out_docx)
+        doc_paths.append(out_docx)
+
+    zip_path = os.path.join(tmpdir, zip_name)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in doc_paths:
+            zf.write(p, arcname=os.path.basename(p))
+
+    return zip_path
 
 # ----------------------- Main (state-agnostic CLI) -----------------------
 
