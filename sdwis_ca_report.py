@@ -51,16 +51,164 @@ TABLE_FIELDS = {
 
 # Descriptions for common codes (expand as needed)
 CODE_DESCRIPTIONS = {
+    # --- Summary codes ---
+    "PWS_TYPE_CODE": {
+        # Your requested spellings
+        "CWS": "Community Water System",
+        "NP": "Non-Public",
+        "NTNCWS": "Non-Transient, Non-Community Water System",
+        "TNCWS": "Transient, Non-Community Water System",
+        "U": "Unknown",
+        # Also accept legacy short forms (seen in some SDWIS pulls)
+        "C": "Community Water System",
+        "NTNC": "Non-Transient, Non-Community Water System",
+        "NC": "Transient, Non-Community Water System",
+    },
+    "OWNER_TYPE_CODE": {
+        "F": "Federal government",
+        "L": "Local government",
+        "N": "Native American",
+        "P": "Private",
+        "M": "Public/Private",
+        "S": "State government",
+    },
     "PWS_ACTIVITY_CODE": {"A": "Active", "I": "Inactive"},
-    "PRIMARY_SOURCE_CODE": {"GW": "Ground Water", "SW": "Surface Water", "GU": "GW under influence"},
-    "GW_SW_CODE": {"GW": "Ground Water", "SW": "Surface Water", "GU": "GW under influence"},
-    "OWNER_TYPE_CODE": {"P": "Private", "M": "Municipal", "S": "State", "F": "Federal", "N": "Non-Transient Non-Community"},
-    "PWS_TYPE_CODE": {"C": "Community", "NTNC": "Non-Transient Non-Community", "NC": "Non-Community"},
-    "IS_WHOLESALER_IND": {"Y": "Yes", "N": "No"},
-    "IS_GRANT_ELIGIBLE_IND": {"Y": "Yes", "N": "No"},
-    "IS_HEALTH_BASED_IND": {"Y": "Yes", "N": "No"},
-    "COMPLIANCE_STATUS_CODE": {"S": "In Compliance", "V": "In Violation"},
+
+    # --- Facility codes ---
+    "FACILITY_TYPE_CODE": {
+        "CC": "Consecutive Connection",
+        "IG": "Infiltration Gallery",
+        "IN": "Intake",
+        "NP": "Non-piped",
+        "RC": "Roof Catchment",
+        "RS": "Reservoir",
+        "SP": "Spring",
+        "WL": "Well (Source)",
+    },
+    "WATER_TYPE_CODE": {
+        "GW": "Ground Water",
+        "SW": "Surface Water",
+        "GU": "Ground water under the influence of surface water",
+    },
+    "AVAILABILITY_CODE": {
+        "E": "Emergency",
+        "I": "Interim",
+        "O": "Other",
+        "P": "Permanent",
+        "S": "Seasonal",
+        "U": "Unknown",
+    },
+
+    # --- Treatment codes ---
+    "TREATMENT_OBJECTIVE_CODE": {
+        "B": "DISINFECTION BY-PRODUCTS CONTROL",
+        "C": "CORROSION CONTROL",
+        "D": "DISINFECTION",
+        "E": "DE-CHLORINATION",
+        "F": "IRON REMOVAL",
+        "I": "INORGANICS REMOVAL",
+        "M": "MANGANESE REMOVAL",
+        "O": "ORGANICS REMOVAL",
+        "P": "PARTICULATE REMOVAL",
+        "R": "RADIONUCLIDES REMOVAL",
+        "S": "SOFTENING (HARDNESS REMOVAL)",
+        "T": "TASTE / ODOR CONTROL",
+        "Z": "OTHER",
+    },
+
+    # --- Violations ---
+    "VIOLATION_CATEGORY_CODE": {
+        "MCL": "Maximum Contaminant Level Violations",
+        "MRDL": "Maximum Residual Disinfectant Level",
+        "TT": "Treatment Technique Violations",
+        "MR": "Monitoring and Reporting Violations",
+    },
+    "VIOLATION_CODE": {
+        # Current
+        "01": "MCL, Single Sample",
+        "02": "MCL, Average",
+        "03": "Monitoring, Regular",
+        "04": "Monitoring, Check/Repeat/Confirmation",
+        "05": "Notification, State",
+        "07": "Treatment Techniques",
+        "08": "Variance/Exemption/Other Compliance",
+        "09": "Record Keeping",
+        "11": "Non-Acute MRDL",
+        "12": "Qualified Operator Failure",
+        "13": "Acute MRDL",
+        "19": "Monitoring, GWR Assessment Source Water",
+        "20": "Failure to Consult/Respond",
+        "27": "Monitoring, Routine (DBP)",
+        "28": "Sanitary Survey Cooperation Failure",
+        "29": "Failure Submit Filter Profile/CPE Report",
+        "30": "Monitoring/Submit Plan (IDSE)",
+        "31": "Monitoring Treatment (SWTR-Unfilt/GWR)",
+        "32": "Reporting and Source Monitoring LT2",
+        "33": "Failure Submit Treatment Requirement Rpt",
+        "34": "Monitoring, GWR Triggered/Additional",
+        "35": "Failure Submit Stage 2 DBPR Report",
+        "36": "Monitoring Treatment (Surface Filter)",
+        "37": "Treatment Tech. No Prior State Approval",
+        "38": "M&R Filter Turbidity Reporting",
+        "39": "Monitoring and Reporting (FBR)",
+        "40": "Treatment Technique (FBR)",
+        "41": "Failure to Maintain Microbial Treatment",
+        "42": "Failure to Provide Treatment",
+        "43": "Single Turbidity Exceed (Enhanced SWTR)",
+        "44": "Treatment Technique Exceeds Turb 0.3 NTU",
+        "45": "Failure Address a Deficiency",
+        "46": "Treatment Technique Precursor Removal",
+        "47": "Treatment Technique Uncovered Reservoir",
+        "48": "Failure To Address Contamination",
+        "51": "Initial LCR Tap Sampling",
+        "52": "Follow-up and Routine Tap Sampling",
+        "53": "Water Quality Parameter M & R",
+        "56": "Initial, Follow-up, or Routine SOWT M&R",
+        "57": "OCCT/SOWT Recommendation",
+        "58": "OCCT/SOWT Installation",
+        "59": "Water Quality Parameter Non-Compliance",
+        "63": "MPL Non-Compliance",
+        "64": "Lead Service Line Replacement (LSLR)",
+        "65": "Public Education",
+        "66": "Lead Consumer Notice",
+        "71": "CCR Complete Failure to Report",
+        "72": "CCR Inadequate Reporting",
+        "73": "Failure to Notify Other PWS",
+        "75": "PN Violation for an NPDWR Violation",
+        "76": "PN Violation without NPDWR Violation",
+        "77": "Tier 1 PN for Lead ALE",
+        "1A": "MCL, E. coli (RTCR)",
+        "2A": "TT, Level 1 Assessment (RTCR)",
+        "2B": "TT, Level 2 Assessment (RTCR)",
+        "2C": "TT, Corrective/Expedited Actions (RTCR)",
+        "2D": "Treatment Technique Startup Procedures",
+        "2E": "LSL Inventory",
+        "3A": "Monitoring, Routine (RTCR)",
+        "3B": "Monitoring, Additional Routine (RTCR)",
+        "3C": "Monitor Coliform Turbidity Trigger (RTCR)",
+        "3D": "Monitoring, Lab Cert/Method Error (RTCR)",
+        "4A": "Reporting, Assessment Forms (RTCR)",
+        "4B": "Report Sample Result/Fail Monitor (RTCR)",
+        "4C": "Report Startup Procedures Cert Form (RTCR)",
+        "4D": "Notification, E Coli Positive (RTCR)",
+        "4E": "Notification, E. coli MCL (RTCR)",
+        "4F": "Notify L1/L2 TT Vio, Correct Action RTCR",
+        "4G": "LSL Reporting",
+        "4H": "LSL Notification",
+        "5A": "Sample Siting Plan Errors (RTCR)",
+        "5B": "Recordkeeping Violations (RTCR)",
+        # Historical
+        "06": "Notification, Public",
+        "10": "Operations Report",
+        "21": "MCL, Acute (TCR)",
+        "22": "MCL, Monthly (TCR)",
+        "23": "Monitoring, Routine Major (TCR)",
+        "24": "Monitoring, Routine Minor (TCR)",
+        "25": "Monitoring, Repeat Major (TCR)",
+        "26": "Monitoring, Repeat Minor (TCR)",
+    },
 }
+
 
 # Paging for local pulls (bump if needed)
 PAGE_SIZE = 50000
@@ -302,32 +450,11 @@ def add_code_descriptions(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | None = None):
-    """
-    Build a structured SDWIS Word report:
-
-    Summary Information for Water Utility [pwsid]
-    USEPA Safe Drinking Water Information System (SDWIS)
-    Water System Name: ...
-    System Type / Activity Status / Ownership
-    State / County Served
-    Administrative Contact / Email
-    Population Served / Service Connections
-    Primary Source / Wholesale Supplier?
-
-    Facilities
-      Sources
-      Treatment
-      Storage
-
-    Violations
-      Health Based
-      Non-Health Based
-    """
     if not HAVE_DOCX:
         print("python-docx is not installed. Install it with: pip install python-docx")
         sys.exit(1)
 
-    # --- helpers -------------------------------------------------------------
+    # --- small helpers -------------------------------------------------------
     def u(df: pd.DataFrame) -> pd.DataFrame:
         return df_upper(df)
 
@@ -337,19 +464,17 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         v = str(df.iloc[0].get(col, "")).strip()
         return v if v else default
 
-    def desc(col: str, val: str) -> str:
-        """Return 'CODE — Description' if we know a mapping; else just the value."""
+    def desc(col: str, val: str | None) -> str:
+        """Show 'CODE — Description' when mapping exists."""
         if val is None or (isinstance(val, float) and pd.isna(val)):
             return "N/A"
         s = str(val).strip()
-        mapping = CODE_DESCRIPTIONS.get(col, {})
-        d = mapping.get(s, "")
+        m = CODE_DESCRIPTIONS.get(col, {})
+        d = m.get(s, "")
         return f"{s} — {d}" if d else s
 
     def yn_from(code: str | None) -> str:
-        if code is None or (isinstance(code, float) and pd.isna(code)):
-            return "N/A"
-        s = str(code).strip().upper()
+        s = ("" if code is None else str(code).strip().upper())
         return {"Y": "Yes", "N": "No"}.get(s, s or "N/A")
 
     def active_from(code: str | None) -> str:
@@ -358,7 +483,6 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
 
     def add_table(doc, headers: list[str], rows: list[list[str]]):
         t = doc.add_table(rows=1, cols=len(headers))
-        # Be defensive about style (some environments don't have "Table Grid")
         try:
             t.style = "Table Grid"
         except Exception:
@@ -367,104 +491,99 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
             t.cell(0, j).text = str(h)
         for r in rows:
             cells = t.add_row().cells
-            for j, val in enumerate(r):
-                cells[j].text = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val)
+            for j, v in enumerate(r):
+                cells[j].text = "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
 
-    # --- source tables -------------------------------------------------------
-    ws = u(data.get("WATER_SYSTEM", pd.DataFrame()))
-    ga = u(data.get("GEOGRAPHIC_AREA", pd.DataFrame()))
+    # --- source tables --------------------------------------------------------
+    ws  = u(data.get("WATER_SYSTEM", pd.DataFrame()))
+    ga  = u(data.get("GEOGRAPHIC_AREA", pd.DataFrame()))
     wsf = u(data.get("WATER_SYSTEM_FACILITY", pd.DataFrame()))
     vio = u(data.get("VIOLATION", pd.DataFrame()))
-    trt = u(data.get("TREATMENT", pd.DataFrame()))
+    trt = u(data.get("TREATMENT", pd.DataFrame()))  # requires TABLE_FIELDS entry
 
-    # --- summary fields ------------------------------------------------------
-    ws_name = get1(ws, "PWS_NAME")
-    pws_type = desc("PWS_TYPE_CODE", get1(ws, "PWS_TYPE_CODE"))
-    pws_activity = desc("PWS_ACTIVITY_CODE", get1(ws, "PWS_ACTIVITY_CODE"))
-    owner = desc("OWNER_TYPE_CODE", get1(ws, "OWNER_TYPE_CODE"))
-    state = get1(ws, "STATE_CODE", pwsid[:2] if isinstance(pwsid, str) else "N/A")
+    # --- summary block --------------------------------------------------------
+    ws_name     = get1(ws, "PWS_NAME")
+    pws_type    = desc("PWS_TYPE_CODE", get1(ws, "PWS_TYPE_CODE"))
+    pws_act     = desc("PWS_ACTIVITY_CODE", get1(ws, "PWS_ACTIVITY_CODE"))
+    owner       = desc("OWNER_TYPE_CODE", get1(ws, "OWNER_TYPE_CODE"))
+    state       = get1(ws, "STATE_CODE", pwsid[:2] if isinstance(pwsid, str) else "N/A")
+    admin       = get1(ws, "ADMIN_NAME")
+    email       = get1(ws, "EMAIL_ADDR")
+    pop         = get1(ws, "POPULATION_SERVED_COUNT")
+    svc_conn    = get1(ws, "SERVICE_CONNECTIONS_COUNT")
+    primary_src = desc("PRIMARY_SOURCE_CODE", get1(ws, "PRIMARY_SOURCE_CODE"))
+    wholesaler  = yn_from(get1(ws, "IS_WHOLESALER_IND"))
 
-    # County Served: prefer GA.COUNTY_SERVED if present (first non-empty)
+    # County Served: first non-empty GA row
     county = "N/A"
     if not ga.empty and "COUNTY_SERVED" in ga.columns:
         non_empty = ga["COUNTY_SERVED"].dropna().astype(str).str.strip()
         if not non_empty.empty:
             county = non_empty.iloc[0] or "N/A"
 
-    admin = get1(ws, "ADMIN_NAME")
-    email = get1(ws, "EMAIL_ADDR")
-    pop = get1(ws, "POPULATION_SERVED_COUNT")
-    svc_conn = get1(ws, "SERVICE_CONNECTIONS_COUNT")
-    primary_src = desc("PRIMARY_SOURCE_CODE", get1(ws, "PRIMARY_SOURCE_CODE"))
-    wholesaler = yn_from(get1(ws, "IS_WHOLESALER_IND"))
-
-    # --- document build ------------------------------------------------------
     doc = Document()
     doc.add_heading(f"Summary Information for Water Utility {pwsid}", level=0)
     doc.add_paragraph("USEPA Safe Drinking Water Information System (SDWIS)")
-
-    # Summary block
     doc.add_paragraph(f"Water System Name: {ws_name}")
-    doc.add_paragraph(
-        f"System Type: {pws_type}    "
-        f"Activity Status: {pws_activity}    "
-        f"Ownership: {owner}"
-    )
+    doc.add_paragraph(f"System Type: {pws_type}    Activity Status: {pws_act}    Ownership: {owner}")
     doc.add_paragraph(f"State: {state}    County Served: {county}")
     doc.add_paragraph(f"Administrative Contact: {admin}    Email address: {email}")
     doc.add_paragraph(f"Population Served: {pop}    Service Connections: {svc_conn}")
     doc.add_paragraph(f"Primary Source: {primary_src}    Wholesale Supplier to Other PWS’s: {wholesaler}")
 
-    # --- Facilities ----------------------------------------------------------
+    # ======================== Facilities =====================================
     doc.add_heading("Facilities", level=1)
 
-    # Sources (from WATER_SYSTEM_FACILITY where IS_SOURCE_IND == 'Y')
+    # -------- Sources (only IS_SOURCE_IND == 'Y'), sorted by type, activity, name
     doc.add_paragraph("Sources")
-    source_rows = []
+    src_rows = []
     if not wsf.empty:
-        # Normalize columns we rely on
-        for col in ["IS_SOURCE_IND", "FACILITY_ACTIVITY_CODE", "FACILITY_TYPE_CODE", "WATER_TYPE_CODE", "AVAILABILITY_CODE"]:
-            if col in wsf.columns:
-                wsf[col] = wsf[col].astype(str)
-        mask_src = wsf["IS_SOURCE_IND"].astype(str).str.upper().eq("Y") if "IS_SOURCE_IND" in wsf.columns else pd.Series(False, index=wsf.index)
-        src_df = wsf[mask_src] if "IS_SOURCE_IND" in wsf.columns else pd.DataFrame()
+        wsf2 = wsf.copy()
+        for c in ("IS_SOURCE_IND","FACILITY_TYPE_CODE","FACILITY_ACTIVITY_CODE","FACILITY_NAME"):
+            if c in wsf2.columns:
+                wsf2[c] = wsf2[c].astype(str)
+        mask_src = wsf2["IS_SOURCE_IND"].str.upper().eq("Y") if "IS_SOURCE_IND" in wsf2.columns else pd.Series(False, index=wsf2.index)
+        src_df = wsf2[mask_src].copy() if "IS_SOURCE_IND" in wsf2.columns else pd.DataFrame()
         if not src_df.empty:
+            # Sort: facility_type_code, facility_activity_code, facility_name
+            sort_cols = [c for c in ["FACILITY_TYPE_CODE","FACILITY_ACTIVITY_CODE","FACILITY_NAME"] if c in src_df.columns]
+            if sort_cols:
+                src_df = src_df.sort_values(sort_cols, kind="mergesort")  # stable sort
             for _, r in src_df.iterrows():
-                source_rows.append([
-                    r.get("FACILITY_TYPE_CODE", ""),
+                src_rows.append([
+                    desc("FACILITY_TYPE_CODE", r.get("FACILITY_TYPE_CODE", "")),
                     active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
                     r.get("FACILITY_NAME", ""),
                     r.get("FACILITY_ID", ""),
                     r.get("STATE_FACILITY_ID", ""),
-                    r.get("WATER_TYPE_CODE", ""),
-                    r.get("AVAILABILITY_CODE", ""),
+                    desc("WATER_TYPE_CODE", r.get("WATER_TYPE_CODE", "")),
+                    desc("AVAILABILITY_CODE", r.get("AVAILABILITY_CODE", "")),
                 ])
-    if source_rows:
+    if src_rows:
         add_table(doc,
                   headers=["Type", "Active?", "Name", "SDWIS Facility ID", "State Facility ID", "Water Type", "Availability"],
-                  rows=source_rows)
+                  rows=src_rows)
     else:
         doc.add_paragraph("No data available.")
 
-    # Treatment (from TREATMENT table)
-    doc.add_paragraph("")  # small spacer
+    # -------- Treatment (sort by facility_name)
+    doc.add_paragraph("")  # spacer
     doc.add_paragraph("Treatment")
     tr_rows = []
     if not trt.empty:
-        # Expect: COMMENTS_TEXT, FACILITY_ID, PWSID, TREATMENT_ID, TREATMENT_OBJECTIVE_CODE, TREATMENT_PROCESS_CODE
-        # We'll merge facility info to show Name/State Facility ID if possible
-        fac_cols = ["FACILITY_ID", "FACILITY_NAME", "STATE_FACILITY_ID", "FACILITY_ACTIVITY_CODE"]
-        fac_min = wsf[fac_cols].drop_duplicates("FACILITY_ID") if not wsf.empty and "FACILITY_ID" in wsf.columns else pd.DataFrame()
-        td = trt.copy()
-        if not fac_min.empty:
-            td = td.merge(fac_min, on="FACILITY_ID", how="left")
+        fac_min = pd.DataFrame()
+        if not wsf.empty and "FACILITY_ID" in wsf.columns:
+            fac_min = wsf[["FACILITY_ID","FACILITY_NAME","STATE_FACILITY_ID","FACILITY_ACTIVITY_CODE"]].drop_duplicates("FACILITY_ID")
+        td = trt.merge(fac_min, on="FACILITY_ID", how="left") if not fac_min.empty else trt.copy()
+        if "FACILITY_NAME" in td.columns:
+            td = td.sort_values(["FACILITY_NAME"], kind="mergesort")
         for _, r in td.iterrows():
             tr_rows.append([
                 r.get("FACILITY_NAME", ""),
                 active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
                 r.get("FACILITY_ID", ""),
                 r.get("STATE_FACILITY_ID", ""),
-                r.get("TREATMENT_OBJECTIVE_CODE", ""),  # you can map codes later if you add a description dict
+                desc("TREATMENT_OBJECTIVE_CODE", r.get("TREATMENT_OBJECTIVE_CODE", "")),
                 r.get("TREATMENT_PROCESS_CODE", ""),
             ])
     if tr_rows:
@@ -474,20 +593,28 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-    # Storage (from WATER_SYSTEM_FACILITY where FACILITY_TYPE_CODE contains 'STORAGE')
-    doc.add_paragraph("")  # small spacer
+    # -------- Storage (sort by facility_name)
+    doc.add_paragraph("")  # spacer
     doc.add_paragraph("Storage")
     stor_rows = []
-    if not wsf.empty and "FACILITY_TYPE_CODE" in wsf.columns:
-        storage_mask = wsf["FACILITY_TYPE_CODE"].astype(str).str.contains("STORAGE", case=False, na=False)
-        stor_df = wsf[storage_mask]
-        for _, r in stor_df.iterrows():
-            stor_rows.append([
-                r.get("FACILITY_NAME", ""),
-                active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
-                r.get("FACILITY_ID", ""),
-                r.get("STATE_FACILITY_ID", ""),
-            ])
+    if not wsf.empty:
+        df = wsf.copy()
+        for c in ("FACILITY_TYPE_CODE","FACILITY_NAME"):
+            if c in df.columns:
+                df[c] = df[c].astype(str)
+        # heuristic: treat anything with 'STORAGE' in type as storage
+        mask = df["FACILITY_TYPE_CODE"].str.contains("STORAGE", case=False, na=False) if "FACILITY_TYPE_CODE" in df.columns else pd.Series(False, index=df.index)
+        sd = df[mask].copy()
+        if not sd.empty:
+            if "FACILITY_NAME" in sd.columns:
+                sd = sd.sort_values(["FACILITY_NAME"], kind="mergesort")
+            for _, r in sd.iterrows():
+                stor_rows.append([
+                    r.get("FACILITY_NAME", ""),
+                    active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
+                    r.get("FACILITY_ID", ""),
+                    r.get("STATE_FACILITY_ID", ""),
+                ])
     if stor_rows:
         add_table(doc,
                   headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID"],
@@ -495,51 +622,56 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-    # --- Violations ----------------------------------------------------------
+    # ======================== Violations =====================================
     doc.add_heading("Violations", level=1)
 
-    def build_vio_rows(df: pd.DataFrame) -> list[list[str]]:
+    def vio_rows_from(df: pd.DataFrame) -> list[list[str]]:
         rows = []
         for _, r in df.iterrows():
             rows.append([
-                r.get("VIOLATION_CATEGORY_CODE", ""),
-                r.get("VIOLATION_CODE", ""),
+                desc("VIOLATION_CATEGORY_CODE", r.get("VIOLATION_CATEGORY_CODE", "")),
+                desc("VIOLATION_CODE", r.get("VIOLATION_CODE", "")),
                 r.get("CONTAMINANT_CODE", ""),
             ])
         return rows
 
-    # Health Based
+    # Health Based: only IS_HEALTH_BASED_IND == 'Y', sorted by category then code
     doc.add_paragraph("Health Based")
     hb_rows = []
     if not vio.empty and "IS_HEALTH_BASED_IND" in vio.columns:
-        hb = vio[vio["IS_HEALTH_BASED_IND"].astype(str).str.upper().eq("Y")]
-        hb_rows = build_vio_rows(hb)
+        hb = vio[vio["IS_HEALTH_BASED_IND"].astype(str).str.upper().eq("Y")].copy()
+        # sort by raw codes (not descriptions)
+        sort_cols = [c for c in ["VIOLATION_CATEGORY_CODE","VIOLATION_CODE"] if c in hb.columns]
+        if sort_cols:
+            hb = hb.sort_values(sort_cols, kind="mergesort")
+        hb_rows = vio_rows_from(hb)
     if hb_rows:
         add_table(doc, headers=["Category", "Type", "Contaminant"], rows=hb_rows)
     else:
         doc.add_paragraph("No data available.")
 
-    # Non-Health Based
+    # Non-Health Based: only IS_HEALTH_BASED_IND == 'N', sorted by category then code
     doc.add_paragraph("")  # spacer
     doc.add_paragraph("Non-Health Based")
     nh_rows = []
     if not vio.empty and "IS_HEALTH_BASED_IND" in vio.columns:
-        nh = vio[vio["IS_HEALTH_BASED_IND"].astype(str).str.upper().eq("N")]
-        nh_rows = build_vio_rows(nh)
+        nh = vio[vio["IS_HEALTH_BASED_IND"].astype(str).str.upper().eq("N")].copy()
+        sort_cols = [c for c in ["VIOLATION_CATEGORY_CODE","VIOLATION_CODE"] if c in nh.columns]
+        if sort_cols:
+            nh = nh.sort_values(sort_cols, kind="mergesort")
+        nh_rows = vio_rows_from(nh)
     if nh_rows:
         add_table(doc, headers=["Category", "Type", "Contaminant"], rows=nh_rows)
     else:
         doc.add_paragraph("No data available.")
 
-    # --- finalize ------------------------------------------------------------
+    # --- write ----------------------------------------------------------------
     if out_path is None:
         out_path = f"{pwsid}_SDWIS_Report.docx"
     doc.save(out_path)
     print(f"Report saved: {out_path}")
     return out_path
 
-# --- Build multiple reports into a ZIP -------------------------------------
-import tempfile, os, zipfile
 
 def generate_reports_zip(pwsids: list[str], fetch_data_fn, zip_name: str = "SDWIS_Reports.zip") -> str:
     """
