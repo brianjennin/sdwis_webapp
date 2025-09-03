@@ -599,9 +599,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-    # -------- Storage: simple detection for now; sort by facility_name
-    doc.add_paragraph("")  # spacer
-    doc.add_paragraph("Storage")
+# -------- Storage (conditional section; simple detection)
     stor_rows = []
     if not wsf.empty and "FACILITY_TYPE_CODE" in wsf.columns:
         sd = wsf[wsf["FACILITY_TYPE_CODE"].astype(str).str.contains("STORAGE", case=False, na=False)].copy()
@@ -614,12 +612,15 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
                 r.get("FACILITY_ID", ""),
                 r.get("STATE_FACILITY_ID", ""),
             ])
+    
     if stor_rows:
+        doc.add_paragraph("")  # spacer
+        doc.add_paragraph("Storage")
         add_table(doc,
                   headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID"],
                   rows=stor_rows)
-    else:
-        doc.add_paragraph("No data available.")
+    # else: omit the Storage section entirely
+
 
     # ======================== Violations ========================
     doc.add_heading("Violations", level=1)
