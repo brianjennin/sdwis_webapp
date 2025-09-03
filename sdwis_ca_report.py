@@ -302,59 +302,242 @@ def add_code_descriptions(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | None = None):
+    """
+    Build a structured SDWIS Word report:
+
+    Summary Information for Water Utility [pwsid]
+    USEPA Safe Drinking Water Information System (SDWIS)
+    Water System Name: ...
+    System Type / Activity Status / Ownership
+    State / County Served
+    Administrative Contact / Email
+    Population Served / Service Connections
+    Primary Source / Wholesale Supplier?
+
+    Facilities
+      Sources
+      Treatment
+      Storage
+
+    Violations
+      Health Based
+      Non-Health Based
+    """
     if not HAVE_DOCX:
         print("python-docx is not installed. Install it with: pip install python-docx")
         sys.exit(1)
 
-    doc = Document()
-    doc.add_heading(f"SDWIS Report — {pwsid}", level=0)
+    # --- helpers -------------------------------------------------------------
+    def u(df: pd.DataFrame) -> pd.DataFrame:
+        return df_upper(df)
 
-    ws = data.get("WATER_SYSTEM", pd.DataFrame())
-    ga = data.get("GEOGRAPHIC_AREA", pd.DataFrame())
-    ws_name = ws.iloc[0]["PWS_NAME"] if not ws.empty and "PWS_NAME" in ws.columns else "N/A"
-    county = ga.iloc[0]["COUNTY_SERVED"] if not ga.empty and "COUNTY_SERVED" in ga.columns else "N/A"
-    # Prefer CITY_NAME from WATER_SYSTEM; fallback to GA.CITY_SERVED; else N/A
-    city = "N/A"
-    if not ws.empty and "CITY_NAME" in ws.columns:
-        v = str(ws.iloc[0].get("CITY_NAME", "")).strip()
-        if v:
-            city = v
-    if city == "N/A" and not ga.empty and "CITY_SERVED" in ga.columns:
-        v = str(ga.iloc[0].get("CITY_SERVED", "")).strip()
-        if v:
-            city = v
+    def get1(df: pd.DataFrame, col: str, default: str = "N/A") -> str:
+        if df.empty or col not in df.columns:
+            return default
+        v = str(df.iloc[0].get(col, "")).strip()
+        return v if v else default
 
-    state = ws.iloc[0]["STATE_CODE"] if not ws.empty and "STATE_CODE" in ws.columns else (pwsid[:2] if isinstance(pwsid, str) else "N/A")
+    def desc(col: str, val: str) -> str:
+        """Return 'CODE — Description' if we know a mapping; else just the value."""
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return "N/A"
+        s = str(val).strip()
+        mapping = CODE_DESCRIPTIONS.get(col, {})
+        d = mapping.get(s, "")
+        return f"{s} — {d}" if d else s
 
-    doc.add_paragraph(f"Water System Name: {ws_name}")
-    doc.add_paragraph(f"PWSID: {pwsid}")
-    doc.add_paragraph(f"State: {state}")
-    doc.add_paragraph(f"County Served: {county}")
-    doc.add_paragraph(f"City Served: {city}")
+    def yn_from(code: str | None) -> str:
+        if code is None or (isinstance(code, float) and pd.isna(code)):
+            return "N/A"
+        s = str(code).strip().upper()
+        return {"Y": "Yes", "N": "No"}.get(s, s or "N/A")
 
-    for table, df in data.items():
-        doc.add_heading(table.replace("_", " ").title(), level=1)
-        if df.empty:
-            doc.add_paragraph("No data available.")
-            continue
-        df2 = add_code_descriptions(df)
-        ncols = len(df2.columns)
-        header = list(df2.columns)
-        t = doc.add_table(rows=1, cols=ncols)
-        t.style = "Table Grid"
-        for j, col in enumerate(header):
-            t.cell(0, j).text = str(col)
-        for _, row in df2.iterrows():
+    def active_from(code: str | None) -> str:
+        s = ("" if code is None else str(code).strip().upper())
+        return {"A": "Yes", "I": "No"}.get(s, s or "N/A")
+
+    def add_table(doc, headers: list[str], rows: list[list[str]]):
+        t = doc.add_table(rows=1, cols=len(headers))
+        # Be defensive about style (some environments don't have "Table Grid")
+        try:
+            t.style = "Table Grid"
+        except Exception:
+            pass
+        for j, h in enumerate(headers):
+            t.cell(0, j).text = str(h)
+        for r in rows:
             cells = t.add_row().cells
-            for j, col in enumerate(header):
-                val = row[col]
-                cells[j].text = "" if pd.isna(val) else str(val)
+            for j, val in enumerate(r):
+                cells[j].text = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val)
 
+    # --- source tables -------------------------------------------------------
+    ws = u(data.get("WATER_SYSTEM", pd.DataFrame()))
+    ga = u(data.get("GEOGRAPHIC_AREA", pd.DataFrame()))
+    wsf = u(data.get("WATER_SYSTEM_FACILITY", pd.DataFrame()))
+    vio = u(data.get("VIOLATION", pd.DataFrame()))
+    trt = u(data.get("TREATMENT", pd.DataFrame()))
+
+    # --- summary fields ------------------------------------------------------
+    ws_name = get1(ws, "PWS_NAME")
+    pws_type = desc("PWS_TYPE_CODE", get1(ws, "PWS_TYPE_CODE"))
+    pws_activity = desc("PWS_ACTIVITY_CODE", get1(ws, "PWS_ACTIVITY_CODE"))
+    owner = desc("OWNER_TYPE_CODE", get1(ws, "OWNER_TYPE_CODE"))
+    state = get1(ws, "STATE_CODE", pwsid[:2] if isinstance(pwsid, str) else "N/A")
+
+    # County Served: prefer GA.COUNTY_SERVED if present (first non-empty)
+    county = "N/A"
+    if not ga.empty and "COUNTY_SERVED" in ga.columns:
+        non_empty = ga["COUNTY_SERVED"].dropna().astype(str).str.strip()
+        if not non_empty.empty:
+            county = non_empty.iloc[0] or "N/A"
+
+    admin = get1(ws, "ADMIN_NAME")
+    email = get1(ws, "EMAIL_ADDR")
+    pop = get1(ws, "POPULATION_SERVED_COUNT")
+    svc_conn = get1(ws, "SERVICE_CONNECTIONS_COUNT")
+    primary_src = desc("PRIMARY_SOURCE_CODE", get1(ws, "PRIMARY_SOURCE_CODE"))
+    wholesaler = yn_from(get1(ws, "IS_WHOLESALER_IND"))
+
+    # --- document build ------------------------------------------------------
+    doc = Document()
+    doc.add_heading(f"Summary Information for Water Utility {pwsid}", level=0)
+    doc.add_paragraph("USEPA Safe Drinking Water Information System (SDWIS)")
+
+    # Summary block
+    doc.add_paragraph(f"Water System Name: {ws_name}")
+    doc.add_paragraph(
+        f"System Type: {pws_type}    "
+        f"Activity Status: {pws_activity}    "
+        f"Ownership: {owner}"
+    )
+    doc.add_paragraph(f"State: {state}    County Served: {county}")
+    doc.add_paragraph(f"Administrative Contact: {admin}    Email address: {email}")
+    doc.add_paragraph(f"Population Served: {pop}    Service Connections: {svc_conn}")
+    doc.add_paragraph(f"Primary Source: {primary_src}    Wholesale Supplier to Other PWS’s: {wholesaler}")
+
+    # --- Facilities ----------------------------------------------------------
+    doc.add_heading("Facilities", level=1)
+
+    # Sources (from WATER_SYSTEM_FACILITY where IS_SOURCE_IND == 'Y')
+    doc.add_paragraph("Sources")
+    source_rows = []
+    if not wsf.empty:
+        # Normalize columns we rely on
+        for col in ["IS_SOURCE_IND", "FACILITY_ACTIVITY_CODE", "FACILITY_TYPE_CODE", "WATER_TYPE_CODE", "AVAILABILITY_CODE"]:
+            if col in wsf.columns:
+                wsf[col] = wsf[col].astype(str)
+        mask_src = wsf["IS_SOURCE_IND"].astype(str).str.upper().eq("Y") if "IS_SOURCE_IND" in wsf.columns else pd.Series(False, index=wsf.index)
+        src_df = wsf[mask_src] if "IS_SOURCE_IND" in wsf.columns else pd.DataFrame()
+        if not src_df.empty:
+            for _, r in src_df.iterrows():
+                source_rows.append([
+                    r.get("FACILITY_TYPE_CODE", ""),
+                    active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
+                    r.get("FACILITY_NAME", ""),
+                    r.get("FACILITY_ID", ""),
+                    r.get("STATE_FACILITY_ID", ""),
+                    r.get("WATER_TYPE_CODE", ""),
+                    r.get("AVAILABILITY_CODE", ""),
+                ])
+    if source_rows:
+        add_table(doc,
+                  headers=["Type", "Active?", "Name", "SDWIS Facility ID", "State Facility ID", "Water Type", "Availability"],
+                  rows=source_rows)
+    else:
+        doc.add_paragraph("No data available.")
+
+    # Treatment (from TREATMENT table)
+    doc.add_paragraph("")  # small spacer
+    doc.add_paragraph("Treatment")
+    tr_rows = []
+    if not trt.empty:
+        # Expect: COMMENTS_TEXT, FACILITY_ID, PWSID, TREATMENT_ID, TREATMENT_OBJECTIVE_CODE, TREATMENT_PROCESS_CODE
+        # We'll merge facility info to show Name/State Facility ID if possible
+        fac_cols = ["FACILITY_ID", "FACILITY_NAME", "STATE_FACILITY_ID", "FACILITY_ACTIVITY_CODE"]
+        fac_min = wsf[fac_cols].drop_duplicates("FACILITY_ID") if not wsf.empty and "FACILITY_ID" in wsf.columns else pd.DataFrame()
+        td = trt.copy()
+        if not fac_min.empty:
+            td = td.merge(fac_min, on="FACILITY_ID", how="left")
+        for _, r in td.iterrows():
+            tr_rows.append([
+                r.get("FACILITY_NAME", ""),
+                active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
+                r.get("FACILITY_ID", ""),
+                r.get("STATE_FACILITY_ID", ""),
+                r.get("TREATMENT_OBJECTIVE_CODE", ""),  # you can map codes later if you add a description dict
+                r.get("TREATMENT_PROCESS_CODE", ""),
+            ])
+    if tr_rows:
+        add_table(doc,
+                  headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID", "Treatment Objective", "Treatment Process"],
+                  rows=tr_rows)
+    else:
+        doc.add_paragraph("No data available.")
+
+    # Storage (from WATER_SYSTEM_FACILITY where FACILITY_TYPE_CODE contains 'STORAGE')
+    doc.add_paragraph("")  # small spacer
+    doc.add_paragraph("Storage")
+    stor_rows = []
+    if not wsf.empty and "FACILITY_TYPE_CODE" in wsf.columns:
+        storage_mask = wsf["FACILITY_TYPE_CODE"].astype(str).str.contains("STORAGE", case=False, na=False)
+        stor_df = wsf[storage_mask]
+        for _, r in stor_df.iterrows():
+            stor_rows.append([
+                r.get("FACILITY_NAME", ""),
+                active_from(r.get("FACILITY_ACTIVITY_CODE", "")),
+                r.get("FACILITY_ID", ""),
+                r.get("STATE_FACILITY_ID", ""),
+            ])
+    if stor_rows:
+        add_table(doc,
+                  headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID"],
+                  rows=stor_rows)
+    else:
+        doc.add_paragraph("No data available.")
+
+    # --- Violations ----------------------------------------------------------
+    doc.add_heading("Violations", level=1)
+
+    def build_vio_rows(df: pd.DataFrame) -> list[list[str]]:
+        rows = []
+        for _, r in df.iterrows():
+            rows.append([
+                r.get("VIOLATION_CATEGORY_CODE", ""),
+                r.get("VIOLATION_CODE", ""),
+                r.get("CONTAMINANT_CODE", ""),
+            ])
+        return rows
+
+    # Health Based
+    doc.add_paragraph("Health Based")
+    hb_rows = []
+    if not vio.empty and "IS_HEALTH_BASED_IND" in vio.columns:
+        hb = vio[vio["IS_HEALTH_BASED_IND"].astype(str).str.upper().eq("Y")]
+        hb_rows = build_vio_rows(hb)
+    if hb_rows:
+        add_table(doc, headers=["Category", "Type", "Contaminant"], rows=hb_rows)
+    else:
+        doc.add_paragraph("No data available.")
+
+    # Non-Health Based
+    doc.add_paragraph("")  # spacer
+    doc.add_paragraph("Non-Health Based")
+    nh_rows = []
+    if not vio.empty and "IS_HEALTH_BASED_IND" in vio.columns:
+        nh = vio[vio["IS_HEALTH_BASED_IND"].astype(str).str.upper().eq("N")]
+        nh_rows = build_vio_rows(nh)
+    if nh_rows:
+        add_table(doc, headers=["Category", "Type", "Contaminant"], rows=nh_rows)
+    else:
+        doc.add_paragraph("No data available.")
+
+    # --- finalize ------------------------------------------------------------
     if out_path is None:
         out_path = f"{pwsid}_SDWIS_Report.docx"
     doc.save(out_path)
     print(f"Report saved: {out_path}")
     return out_path
+
 
 # ----------------------- Main (state-agnostic CLI) -----------------------
 
