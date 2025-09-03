@@ -1,8 +1,7 @@
-# app.py — All states, GA-first search to keep big states fast
-# - Preloads GEOGRAPHIC_AREA by STATE_SERVED (small)
-# - If county/city provided: filter GA -> get PWSIDs -> fetch WS per PWSID only
-# - If name-only: fall back to full WATER_SYSTEM by state (slow for CA/TX/NY)
-# - Pick system directly in the table; generate Word report(s)
+# app.py — Preload WS + GA for each state, then filter locally
+# - On first state selection: fetch full WATER_SYSTEM + GEOGRAPHIC_AREA once
+# - All searches afterwards are in-memory pandas filters (instant)
+# - Word report generation still per-PWSID via cached_fetch_all_selected
 
 import os
 import re
@@ -14,10 +13,9 @@ from sdwis_ca_report import (
     looks_like_pwsid,
     generate_report,
     fetch_all_selected,
-    pull_rows_filtered,   # used only for GA-by-state and name-only WS-by-state fallback
+    pull_rows_filtered,
     df_upper,
     token_and_contains,
-    fetch_table_by_pwsid, # small per-PWSID fetch
 )
 
 st.set_page_config(page_title="SDWIS – Report Generator (All States)", layout="centered")
@@ -32,9 +30,9 @@ STATES = [
 
 # ---------------- Caching ----------------
 
-@st.cache_data(ttl=60*60*12)  # 12 hours
+@st.cache_data(ttl=60*60*12)  # 12 hours, persisted in memory/disk
 def get_ga_by_state(state: str) -> pd.DataFrame:
-    """Server-side filter GEOGRAPHIC_AREA by STATE_SERVED; keep city/county columns."""
+    """Fetch GEOGRAPHIC_AREA by STATE_SERVED; keep city/county columns."""
     ga = pull_rows_filtered("GEOGRAPHIC_AREA", "STATE_SERVED", (state or "").upper())
     ga = df_upper(ga)
     keep = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED", "STATE_SERVED"] if c in ga.columns]
@@ -44,10 +42,7 @@ def get_ga_by_state(state: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=60*60*12)  # 12 hours
 def get_ws_by_state(state: str) -> pd.DataFrame:
-    """
-    Fallback for name-only searches: WATER_SYSTEM filtered by STATE_CODE.
-    NOTE: For very large states (CA/TX/NY) this may be slow.
-    """
+    """Fetch WATER_SYSTEM by STATE_CODE; keep minimal columns."""
     ws = pull_rows_filtered("WATER_SYSTEM", "STATE_CODE", (state or "").upper())
     ws = df_upper(ws)
     keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
@@ -58,47 +53,33 @@ def cached_fetch_all_selected(pwsid: str):
     """Cache per-system tables for report generation."""
     return fetch_all_selected(pwsid)
 
-# ---------------- Small helpers ----------------
-
-def fetch_ws_min_for_pwsids(pwsids: list[str]) -> pd.DataFrame:
-    """
-    Fetch minimal WATER_SYSTEM info for a *limited* set of PWSIDs using the per-PWSID endpoint.
-    Much faster than downloading the whole state for big states like CA.
-    """
-    rows = []
-    for pid in pwsids:
-        df = fetch_table_by_pwsid("WATER_SYSTEM", pid)
-        if not df.empty:
-            df = df_upper(df)
-            # keep minimal columns if present
-            cols = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in df.columns]
-            if cols:
-                rows.append(df[cols].iloc[:1])  # first row is enough
-    if not rows:
-        return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY_NAME"])
-    out = pd.concat(rows, ignore_index=True).drop_duplicates("PWSID")
-    return out
+# ---------------- Search helpers ----------------
 
 def fast_search(state: str, name_query: str, county_or_city: str | None) -> pd.DataFrame:
     """
-    GA-first strategy:
-    - If county_or_city is provided:
-        1) Filter GA by state & county/city term -> list of PWSIDs
-        2) Fetch WS per PWSID (small calls) to get PWS_NAME/CITY_NAME
-        3) If name_query present, AND-filter those WS rows by name tokens
-        4) Build unified CITY column: prefer CITY_NAME, else CITY_SERVED
-    - If county_or_city is blank:
-        -> name-only fallback: get_ws_by_state(state) and filter by name tokens (may be slow for big states)
+    All searches are local pandas filters on preloaded WS + GA.
     """
     sc = (state or "").strip().upper()
+    ws = get_ws_by_state(sc)
+    ga = get_ga_by_state(sc)
+
+    if ws.empty:
+        return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
+
+    # Add CITY column from WS
+    df = ws.copy()
+    df["CITY"] = df.get("CITY_NAME", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
+
+    # Filter by name tokens if provided
     q = (name_query or "").strip()
+    if q and "PWS_NAME" in df.columns:
+        tokens = re.findall(r"[A-Za-z0-9]+", q)
+        if tokens:
+            m = token_and_contains(df["PWS_NAME"], tokens)
+            df = df[m]
 
-    if county_or_city:
-        # 1) Filter GA by county/city
-        ga = get_ga_by_state(sc)
-        if ga.empty or "PWSID" not in ga.columns:
-            return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
-
+    # Filter by county/city if provided
+    if county_or_city and not ga.empty:
         term = county_or_city.strip().lower()
         m_county = ga["COUNTY_SERVED"].astype(str).str.lower().str.contains(term, na=False) if "COUNTY_SERVED" in ga.columns else False
         m_citysv = ga["CITY_SERVED"].astype(str).str.lower().str.contains(term, na=False)   if "CITY_SERVED"   in ga.columns else False
@@ -107,58 +88,26 @@ def fast_search(state: str, name_query: str, county_or_city: str | None) -> pd.D
         if ga_match.empty:
             return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
 
-        # limit to a reasonable number in case the county is huge
-        pwsids = list(pd.unique(ga_match["PWSID"]))[:5000]
+        df = df.merge(
+            ga_match[["PWSID", "CITY_SERVED", "COUNTY_SERVED"]].drop_duplicates("PWSID"),
+            on="PWSID", how="inner"
+        )
+        # Prefer CITY_NAME, fallback to GA city
+        df["CITY"] = df["CITY"].mask(df["CITY"].eq(""), df["CITY_SERVED"].fillna("").astype(str).str.strip())
 
-        # 2) Minimal WS fetch for these PWSIDs
-        ws_min = fetch_ws_min_for_pwsids(pwsids)   # fast, many small calls
-
-        # 3) Optional AND name filter
-        if q and not ws_min.empty and "PWS_NAME" in ws_min.columns:
-            tokens = re.findall(r"[A-Za-z0-9]+", q)
-            if tokens:
-                m = token_and_contains(ws_min["PWS_NAME"], tokens)
-                ws_min = ws_min[m]
-
-        if ws_min.empty:
-            return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
-
-        # 4) Merge GA (for county/city served) and build unified CITY
-        out = ws_min.merge(ga_match[["PWSID", "CITY_SERVED", "COUNTY_SERVED"]].drop_duplicates("PWSID"),
-                           on="PWSID", how="left")
-        out["CITY"] = ""
-        if "CITY_NAME" in out.columns:
-            out["CITY"] = out["CITY"].mask(out["CITY"].eq(""), out["CITY_NAME"].fillna("").astype(str).str.strip())
-        if "CITY_SERVED" in out.columns:
-            out["CITY"] = out["CITY"].mask(out["CITY"].eq(""), out["CITY_SERVED"].fillna("").astype(str).str.strip())
-
-        display_cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in out.columns]
-        if not display_cols:
-            display_cols = [c for c in ["PWSID", "PWS_NAME"] if c in out.columns]
-        return out[display_cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
-
-    # No county/city -> name-only fallback (may be slow for big states)
-    ws = get_ws_by_state(sc)
-    if ws.empty:
-        return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY"])
-    if q and "PWS_NAME" in ws.columns:
-        tokens = re.findall(r"[A-Za-z0-9]+", q)
-        if tokens:
-            m = token_and_contains(ws["PWS_NAME"], tokens)
-            ws = ws[m]
-    ws["CITY"] = ws.get("CITY_NAME", pd.Series([""] * len(ws))).fillna("").astype(str).str.strip()
-    display_cols = [c for c in ["PWSID", "PWS_NAME", "CITY"] if c in ws.columns]
-    if not display_cols:
-        display_cols = [c for c in ["PWSID", "PWS_NAME"] if c in ws.columns]
-    return ws[display_cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
+    cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in df.columns]
+    return df[cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
 # ---------------- UI ----------------
 
-state = st.selectbox("State", STATES, index=STATES.index("AK") if "AK" in STATES else 0)
+state = st.selectbox("State", STATES, index=STATES.index("CA") if "CA" in STATES else 0)
 
-# Warm only GA cache (quick) — don’t warm WS to keep CA snappy
-with st.spinner(f"Loading locations for {state}… (first time may take a few seconds)"):
-    _ = get_ga_by_state(state)
+# Preload GA + WS cache for this state
+with st.spinner(f"Loading all systems for {state} (first time may take up to a minute)…"):
+    ga = get_ga_by_state(state)
+    ws = get_ws_by_state(state)
+
+st.success(f"{len(ws):,} water systems cached for {state}. Searches are now instant.")
 
 mode = st.radio("Lookup by", ["PWSID", "Name / County or City"], horizontal=True)
 pwsid_to_generate: str | None = None
@@ -184,9 +133,9 @@ else:
     with col1:
         if st.button("Search"):
             if not name.strip() and not county_city.strip():
-                st.warning("Enter a system name, OR a county/city (recommended for large states).")
+                st.warning("Enter a system name, OR a county/city.")
             else:
-                with st.spinner(f"Searching {state} systems…"):
+                with st.spinner(f"Filtering {state} systems…"):
                     matches = fast_search(state, name, county_city or None)
                 st.session_state.matches = None if matches.empty else matches.reset_index(drop=True)
 
@@ -195,21 +144,20 @@ else:
         st.subheader("Matches")
         df = st.session_state.matches.copy()
 
-        # Quick local filter for usability
-        st.write("Tip: filter by PWSID, name, city, or county. You can type multiple words (e.g., `los angeles water`).")
+        # Quick local filter
+        st.write("Tip: filter by PWSID, name, city, or county. Multiple words allowed (e.g., `los angeles water`).")
         qf = st.text_input("Filter rows", key="quick_filter").strip()
         if qf:
             tokens = [t for t in re.findall(r"[A-Za-z0-9]+", qf) if t]
             if tokens:
-                hay = df.fillna("").astype(str).agg(" ".join, axis=1).str.lower()
                 mask = pd.Series(True, index=df.index)
                 for t in tokens:
+                    hay = df.fillna("").astype(str).agg(" ".join, axis=1).str.lower()
                     mask &= hay.str.contains(re.escape(t.lower()), na=False)
                 df = df[mask]
 
         st.caption(f"{len(df):,} systems shown")
 
-        # Add "Select" checkbox column for a single selection
         if "Select" not in df.columns:
             df.insert(0, "Select", False)
         disabled_cols = [c for c in df.columns if c != "Select"]
