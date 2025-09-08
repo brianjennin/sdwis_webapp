@@ -615,6 +615,9 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         for c in ("FACILITY_TYPE_CODE","FACILITY_NAME","FACILITY_ACTIVITY_CODE","IS_SOURCE_IND"):
             if c in df.columns:
                 df[c] = df[c].astype(str)
+                
+        print("FACILITY_TYPE_CODE unique:",
+              sorted(df["FACILITY_TYPE_CODE"].dropna().str.upper().unique().tolist()))
     
         # exclude obvious sources
         not_source = ~df.get("IS_SOURCE_IND", "").str.upper().eq("Y")
