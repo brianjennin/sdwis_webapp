@@ -606,18 +606,29 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     else:
         doc.add_paragraph("No data available.")
 
-# -------- Storage (true SDWIS codes; show only when present)
+# -------- Storage (codes + name fallback; exclude sources; sort by facility_name)
     stor_rows = []
-    if not wsf.empty and "FACILITY_TYPE_CODE" in wsf.columns:
+    if not wsf.empty:
         df = wsf.copy()
-        for c in ("FACILITY_TYPE_CODE","FACILITY_NAME","FACILITY_ACTIVITY_CODE"):
+    
+        # normalize fields we rely on
+        for c in ("FACILITY_TYPE_CODE","FACILITY_NAME","FACILITY_ACTIVITY_CODE","IS_SOURCE_IND"):
             if c in df.columns:
                 df[c] = df[c].astype(str)
     
-        # SDWIS facility type codes that represent storage-ish assets
+        # exclude obvious sources
+        not_source = ~df.get("IS_SOURCE_IND", "").str.upper().eq("Y")
+    
+        # primary: match SDWIS storage-ish facility types
         storage_codes = {"ST", "CW", "RS"}  # Storage, Clear Well, Reservoir
-        mask = df["FACILITY_TYPE_CODE"].str.upper().isin(storage_codes)
-        sd = df[mask].copy()
+        code_hit = df.get("FACILITY_TYPE_CODE", "").str.upper().isin(storage_codes)
+    
+        # fallback: common storage keywords in the name
+        # (kept simple; you can expand this list if you see more patterns)
+        name_pattern = r"\b(TANK|TANKS|CLEARWELL|CLEAR WELL|RESERVOIR|STANDPIPE|ELEVATED|GROUND STORAGE|GST|EST|CST|TOWER)\b"
+        name_hit = df.get("FACILITY_NAME", "").str.contains(name_pattern, case=False, na=False)
+    
+        sd = df[not_source & (code_hit | name_hit)].copy()
     
         if not sd.empty and "FACILITY_NAME" in sd.columns:
             sd = sd.sort_values(["FACILITY_NAME"], kind="mergesort")
@@ -632,11 +643,11 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     
     if stor_rows:
         doc.add_paragraph("")  # spacer
-        doc.add_paragraph("Storage")
+        doc.add_heading("Storage", level=2)
         add_table(doc,
                   headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID"],
                   rows=stor_rows)
-    # else: silently omit Storage when none found
+    # else: omit Storage when none found
 
     # ======================== Violations ========================
     doc.add_heading("Violations", level=1)
