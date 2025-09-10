@@ -635,8 +635,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
             not_source = pd.Series(True, index=df.index)
     
         # choose what counts as storage
-        # If you want ONLY true storage per your note: use {"ST"}
-        storage_codes = {"ST"}  # or {"ST","CW","RS"} to include clear wells & reservoirs
+        storage_codes = {"ST", "RS"}
         if "FACILITY_TYPE_CODE" in df.columns:
             code_hit = df["FACILITY_TYPE_CODE"].str.upper().isin(storage_codes)
         else:
