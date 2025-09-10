@@ -485,13 +485,12 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         return v if v else default
 
     def desc(col: str, val: str | None) -> str:
-        """Show 'CODE — Description' when mapping exists; otherwise raw value."""
+        """Return description only; fall back to raw value if no mapping."""
         if val is None or (isinstance(val, float) and pd.isna(val)):
             return "N/A"
         s = str(val).strip()
-        m = CODE_DESCRIPTIONS.get(col, {})
-        d = m.get(s, "")
-        return f"{s} — {d}" if d else s
+        d = CODE_DESCRIPTIONS.get(col, {}).get(s)
+        return d if (d and d.strip()) else s
 
     def yn_from(code: str | None) -> str:
         s = ("" if code is None else str(code).strip().upper())
