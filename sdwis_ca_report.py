@@ -4,6 +4,10 @@ import re
 import requests
 import pandas as pd
 import functools
+try:
+    from sdwis_code_maps import CONTAMINANT_MAP, VIOLATION_CODE_MAP
+except Exception:
+    CONTAMINANT_MAP, VIOLATION_CODE_MAP = {}, {}
 
 
 # Optional: silence HTTPS warnings if your env uses unverified TLS
@@ -214,6 +218,14 @@ CODE_DESCRIPTIONS = {
         "25": "Monitoring, Repeat Major (TCR)",
         "26": "Monitoring, Repeat Minor (TCR)",
     },
+}
+
+# Use generated maps so desc("...") prints "CODE — Description"
+CODE_DESCRIPTIONS["CONTAMINANT_CODE"] = CONTAMINANT_MAP
+
+CODE_DESCRIPTIONS["VIOLATION_CODE"] = {
+    **CODE_DESCRIPTIONS.get("VIOLATION_CODE", {}),
+    **VIOLATION_CODE_MAP,
 }
 
 
@@ -615,15 +627,12 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         for c in ("FACILITY_TYPE_CODE","FACILITY_NAME","FACILITY_ACTIVITY_CODE","IS_SOURCE_IND"):
             if c in df.columns:
                 df[c] = df[c].astype(str)
-                
-        print("FACILITY_TYPE_CODE unique:",
-              sorted(df["FACILITY_TYPE_CODE"].dropna().str.upper().unique().tolist()))
     
         # exclude obvious sources
         not_source = ~df.get("IS_SOURCE_IND", "").str.upper().eq("Y")
     
         # primary: match SDWIS storage-ish facility types
-        storage_codes = {"ST", "CW", "RS"}  # Storage, Clear Well, Reservoir
+        storage_codes = {"ST", "CW", "RS"}  # Storage, Clear Well, Reservoir NOTE: Remove clear well
         code_hit = df.get("FACILITY_TYPE_CODE", "").str.upper().isin(storage_codes)
     
         # fallback: common storage keywords in the name
