@@ -1,24 +1,27 @@
-# sdwis_ca_report.py
+# sdwis_ca_report.py — imports
 import sys
 import re
+import functools
+
 import requests
 import pandas as pd
-import functools
-try:
-    from sdwis_code_maps import CONTAMINANT_MAP, VIOLATION_CODE_MAP
-except Exception:
-    CONTAMINANT_MAP, VIOLATION_CODE_MAP = {}, {}
 
-
-# Optional: silence HTTPS warnings if your env uses unverified TLS
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
+# Word report support
 try:
     from docx import Document
     HAVE_DOCX = True
 except Exception:
     HAVE_DOCX = False
+
+# Optional: silence HTTPS warnings if your env uses unverified TLS
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Generated code maps (built by generate_code_maps.py)
+try:
+    from sdwis_code_maps import CONTAMINANT_MAP, TREATMENT_PROCESS_MAP
+except Exception:
+    CONTAMINANT_MAP, TREATMENT_PROCESS_MAP = {}, {}
 
 # ----------------------- Config -----------------------
 
@@ -222,12 +225,10 @@ CODE_DESCRIPTIONS = {
 
 # Use generated maps so desc("...") prints "CODE — Description"
 CODE_DESCRIPTIONS["CONTAMINANT_CODE"] = CONTAMINANT_MAP
-
-CODE_DESCRIPTIONS["VIOLATION_CODE"] = {
-    **CODE_DESCRIPTIONS.get("VIOLATION_CODE", {}),
-    **VIOLATION_CODE_MAP,
+CODE_DESCRIPTIONS["TREATMENT_PROCESS_CODE"] = {
+    **CODE_DESCRIPTIONS.get("TREATMENT_PROCESS_CODE", {}),
+    **TREATMENT_PROCESS_MAP,
 }
-
 
 # Paging for local pulls (bump if needed)
 PAGE_SIZE = 50000
@@ -609,7 +610,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
                     r.get("FACILITY_ID", ""),
                     r.get("STATE_FACILITY_ID", ""),
                     desc("TREATMENT_OBJECTIVE_CODE", r.get("TREATMENT_OBJECTIVE_CODE", "")),
-                    r.get("TREATMENT_PROCESS_CODE", ""),
+                    desc("TREATMENT_PROCESS_CODE", r.get("TREATMENT_PROCESS_CODE", "")),
                 ])
     if tr_rows:
         add_table(doc,
@@ -629,16 +630,25 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
                 df[c] = df[c].astype(str)
     
         # exclude obvious sources
-        not_source = ~df.get("IS_SOURCE_IND", "").str.upper().eq("Y")
+        if "IS_SOURCE_IND" in df.columns:
+            not_source = ~df["IS_SOURCE_IND"].str.upper().eq("Y")
+        else:
+            not_source = pd.Series(True, index=df.index)
     
-        # primary: match SDWIS storage-ish facility types
-        storage_codes = {"ST", "CW", "RS"}  # Storage, Clear Well, Reservoir NOTE: Remove clear well
-        code_hit = df.get("FACILITY_TYPE_CODE", "").str.upper().isin(storage_codes)
+        # choose what counts as storage
+        # If you want ONLY true storage per your note: use {"ST"}
+        storage_codes = {"ST"}  # or {"ST","CW","RS"} to include clear wells & reservoirs
+        if "FACILITY_TYPE_CODE" in df.columns:
+            code_hit = df["FACILITY_TYPE_CODE"].str.upper().isin(storage_codes)
+        else:
+            code_hit = pd.Series(False, index=df.index)
     
-        # fallback: common storage keywords in the name
-        # (kept simple; you can expand this list if you see more patterns)
-        name_pattern = r"\b(TANK|TANKS|CLEARWELL|CLEAR WELL|RESERVOIR|STANDPIPE|ELEVATED|GROUND STORAGE|GST|EST|CST|TOWER)\b"
-        name_hit = df.get("FACILITY_NAME", "").str.contains(name_pattern, case=False, na=False)
+        # optional name-based fallback (kept conservative)
+        if "FACILITY_NAME" in df.columns:
+            name_pattern = r"\b(TANK|TANKS|STANDPIPE|ELEVATED|GROUND STORAGE|GST|EST|CST|TOWER)\b"
+            name_hit = df["FACILITY_NAME"].str.contains(name_pattern, case=False, na=False)
+        else:
+            name_hit = pd.Series(False, index=df.index)
     
         sd = df[not_source & (code_hit | name_hit)].copy()
     
@@ -659,7 +669,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         add_table(doc,
                   headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID"],
                   rows=stor_rows)
-    # else: omit Storage when none found
+    # else: omit Storage section
 
     # ======================== Violations ========================
     doc.add_heading("Violations", level=1)
@@ -669,8 +679,8 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
         for _, r in df.iterrows():
             rows.append([
                 desc("VIOLATION_CATEGORY_CODE", r.get("VIOLATION_CATEGORY_CODE", "")),
-                desc("VIOLATION_CODE", r.get("VIOLATION_CODE", "")),
-                r.get("CONTAMINANT_CODE", ""),
+                desc("VIOLATION_CODE",        r.get("VIOLATION_CODE", "")),
+                desc("CONTAMINANT_CODE",      r.get("CONTAMINANT_CODE", "")),  # <-- translate
             ])
         return rows
 
