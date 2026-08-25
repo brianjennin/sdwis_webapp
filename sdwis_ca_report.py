@@ -466,14 +466,41 @@ def ef_systems_by_pwsid(pwsids: list[str], chunk: int = 40, max_chunks: int = 25
     return df_upper(pd.concat(frames, ignore_index=True))
 
 
-EMPTY_RESULT_COLUMNS = ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"]
+EMPTY_RESULT_COLUMNS = ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED", "MATCHED_ON"]
 
 
 def _empty_result() -> pd.DataFrame:
     return pd.DataFrame(columns=EMPTY_RESULT_COLUMNS)
 
 
-def _tidy(ws: pd.DataFrame) -> pd.DataFrame:
+def enforce_state(df: pd.DataFrame, sc: str, stats: list | None = None,
+                  label: str = "") -> pd.DataFrame:
+    """Drop rows that are not in the requested state.
+
+    Envirofacts does NOT reliably honour a chained STATE_CODE filter when the
+    chain also uses an operator such as CONTAINING: a CA search for city
+    "ROSEVILLE" came back with Arizona and Idaho systems. PWSIDs are prefixed
+    with their state, so the state is re-checked here and the server filter is
+    treated as a hint, never a guarantee.
+
+    A non-zero drop count is recorded in stats -- it is direct evidence that
+    the server-side filter was ignored.
+    """
+    if df.empty or "PWSID" not in df.columns:
+        return df
+    keep = df["PWSID"].astype(str).str.upper().str.startswith(sc.upper())
+    dropped = int((~keep).sum())
+    if dropped and stats is not None:
+        stats.append(FetchStats(
+            label=f"{label} state check", rows=int(keep.sum()), pages=0,
+            complete=True,
+            reason=f"dropped {dropped} row(s) outside {sc}; "
+                   f"the server ignored the STATE filter",
+        ))
+    return df[keep]
+
+
+def _tidy(ws: pd.DataFrame, matched_on: str = "") -> pd.DataFrame:
     """Normalise a WATER_SYSTEM frame to the columns the results table shows."""
     if ws.empty or "PWSID" not in ws.columns:
         return _empty_result()
@@ -481,27 +508,41 @@ def _tidy(ws: pd.DataFrame) -> pd.DataFrame:
     if "CITY" not in out.columns:
         out["CITY"] = out.get("CITY_NAME", pd.Series([""] * len(out), index=out.index))
     out["CITY"] = out["CITY"].fillna("").astype(str).str.strip()
-    if "COUNTY_SERVED" not in out.columns:
-        out["COUNTY_SERVED"] = ""
+    for col in ("COUNTY_SERVED", "MATCHED_ON"):
+        if col not in out.columns:
+            out[col] = ""
+    out["COUNTY_SERVED"] = out["COUNTY_SERVED"].fillna("").astype(str).str.strip()
+    if matched_on:
+        out["MATCHED_ON"] = out["MATCHED_ON"].replace("", matched_on)
     cols = [c for c in EMPTY_RESULT_COLUMNS if c in out.columns]
     return out[cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
 
-def _pwsids_serving_place(sc: str, place: str, stats: list) -> list[str]:
-    """PWSIDs whose GEOGRAPHIC_AREA row matches a county OR a served city.
+def areas_serving_place(sc: str, place: str, stats: list) -> pd.DataFrame:
+    """GEOGRAPHIC_AREA rows whose county OR served city matches `place`.
 
-    WATER_SYSTEM.CITY_NAME is the system's own (often administrative) city,
-    which is not the same as the city it serves, so both are consulted.
+    This is the authoritative answer to "which systems serve this place".
+    WATER_SYSTEM.CITY_NAME is NOT -- that is the system's own (often
+    administrative) city, so an operator headquartered in one town matches for
+    systems it runs hundreds of miles away.
     """
-    found: list[str] = []
-    for column in ("COUNTY_SERVED", "CITY_SERVED"):
+    frames = []
+    for column, label in (("COUNTY_SERVED", "county"), ("CITY_SERVED", "served city")):
         ga = ef_query("GEOGRAPHIC_AREA", [
             ("STATE_SERVED", sc),
             (column, "CONTAINING", place.upper()),
         ], stats=stats)
-        if not ga.empty and "PWSID" in ga.columns:
-            found.extend(ga["PWSID"].dropna().astype(str).tolist())
-    return list(dict.fromkeys(found))
+        ga = enforce_state(ga, sc, stats, f"GEOGRAPHIC_AREA {column}")
+        if ga.empty or "PWSID" not in ga.columns:
+            continue
+        keep = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
+        ga = ga[keep].copy()
+        ga["MATCHED_ON"] = label
+        frames.append(ga)
+
+    if not frames:
+        return pd.DataFrame(columns=["PWSID", "CITY_SERVED", "COUNTY_SERVED", "MATCHED_ON"])
+    return pd.concat(frames, ignore_index=True).drop_duplicates("PWSID")
 
 
 def search_systems_targeted(state: str, name_query: str | None,
@@ -511,9 +552,11 @@ def search_systems_targeted(state: str, name_query: str | None,
     Returns (results, stats) so the caller can show what was actually fetched
     and whether any part of it came back incomplete.
 
-    A place-only search does NOT need the full state list: WATER_SYSTEM can be
-    filtered on CITY_NAME directly, and GEOGRAPHIC_AREA carries county and
-    served-city, so both sides can be narrowed server-side and unioned.
+    A place-only search does NOT need the full state list: GEOGRAPHIC_AREA can
+    be filtered on county and served city server-side, and those PWSIDs looked
+    up in batches. Results carry MATCHED_ON so it is visible WHY each system is
+    in the list -- particularly for mailing-city matches, which are the noisy
+    ones.
     """
     sc = (state or "").strip().upper()
     name = (name_query or "").strip()
@@ -526,8 +569,6 @@ def search_systems_targeted(state: str, name_query: str | None,
         raise ValueError("targeted search needs a system name or a place")
 
     if name:
-        # Chain one name token server-side -- the longest, as the most
-        # selective -- then AND any remaining tokens locally.
         tokens = [t for t in re.findall(r"[A-Za-z0-9]+", name) if t]
         if not tokens:
             raise ValueError("no usable name tokens")
@@ -537,6 +578,7 @@ def search_systems_targeted(state: str, name_query: str | None,
             ("STATE_CODE", sc),
             ("PWS_NAME", "CONTAINING", lead.upper()),
         ], stats=stats)
+        ws = enforce_state(ws, sc, stats, "WATER_SYSTEM name")
         if ws.empty or "PWSID" not in ws.columns:
             return _empty_result(), stats
 
@@ -547,32 +589,51 @@ def search_systems_targeted(state: str, name_query: str | None,
             ws = ws[token_and_contains(ws["PWS_NAME"], remaining)]
 
         if not place:
-            return _tidy(ws), stats
+            return _tidy(ws, "system name"), stats
 
-        ids = set(_pwsids_serving_place(sc, place, stats))
-        if not ids:
+        areas = areas_serving_place(sc, place, stats)
+        if areas.empty:
             return _empty_result(), stats
-        return _tidy(ws[ws["PWSID"].astype(str).isin(ids)]), stats
+        merged = ws.merge(areas, on="PWSID", how="inner")
+        return _tidy(merged), stats
 
-    # Place only. Union of systems whose own city matches and systems whose
-    # GEOGRAPHIC_AREA row names the place.
+    # ---- Place only ----
+    # GEOGRAPHIC_AREA is authoritative for "serves this place".
+    areas = areas_serving_place(sc, place, stats)
+
+    # WATER_SYSTEM.CITY_NAME is included as a secondary signal, clearly
+    # labelled, because it is the system's own city and produces matches far
+    # from the place being searched.
     by_city = ef_query("WATER_SYSTEM", [
         ("STATE_CODE", sc),
         ("CITY_NAME", "CONTAINING", place.upper()),
     ], stats=stats)
+    by_city = enforce_state(by_city, sc, stats, "WATER_SYSTEM city")
 
+    area_ids = areas["PWSID"].astype(str).tolist() if not areas.empty else []
     known = set(by_city["PWSID"].astype(str)) if "PWSID" in by_city.columns else set()
-    extra = [i for i in _pwsids_serving_place(sc, place, stats) if i not in known]
+    missing = [i for i in area_ids if i not in known]
 
-    frames = [by_city] if not by_city.empty else []
-    if extra:
-        frames.append(ef_systems_by_pwsid(extra, stats=stats))
+    frames = []
+    if not by_city.empty:
+        keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in by_city.columns]
+        frames.append(by_city[keep])
+    if missing:
+        extra = ef_systems_by_pwsid(missing, stats=stats)
+        extra = enforce_state(extra, sc, stats, "WATER_SYSTEM by PWSID")
+        if not extra.empty:
+            keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in extra.columns]
+            frames.append(extra[keep])
     if not frames:
         return _empty_result(), stats
 
-    combined = pd.concat(frames, ignore_index=True)
-    keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in combined.columns]
-    return _tidy(combined[keep]), stats
+    combined = pd.concat(frames, ignore_index=True).drop_duplicates("PWSID")
+    if not areas.empty:
+        combined = combined.merge(areas, on="PWSID", how="left")
+    combined["MATCHED_ON"] = combined.get(
+        "MATCHED_ON", pd.Series([""] * len(combined), index=combined.index)
+    ).fillna("").replace("", "system city (mailing address, may be far away)")
+    return _tidy(combined), stats
 
 
 def looks_like_pwsid(s: str) -> bool:

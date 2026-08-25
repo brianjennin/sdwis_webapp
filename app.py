@@ -160,8 +160,10 @@ def run_search(state: str, name_query: str, county_or_city: str | None):
 state = st.selectbox("State", STATES, index=STATES.index("CA") if "CA" in STATES else 0)
 
 st.caption(
-    "Name, county and city searches are all filtered server-side — only "
-    "matching rows are transferred."
+    "Name, county and city searches are filtered server-side — only matching "
+    "rows are transferred. Check the 'Matched on' column: 'served city' and "
+    "'county' are authoritative; 'system city' is the operator's mailing "
+    "address and may be far from the place you searched."
 )
 
 mode = st.radio("Lookup by", ["PWSID", "Name / County or City"], horizontal=True)
@@ -264,6 +266,13 @@ else:
                 "PWS_NAME": st.column_config.TextColumn("Water System"),
                 "CITY": st.column_config.TextColumn("City"),
                 "COUNTY_SERVED": st.column_config.TextColumn("County"),
+                "MATCHED_ON": st.column_config.TextColumn(
+                    "Matched on",
+                    help="Why this system is in the list. 'served city' and "
+                         "'county' come from SDWIS geographic areas and are "
+                         "reliable. 'system city' is the operator's mailing "
+                         "address, which can be far from the place you searched.",
+                ),
             },
             key="matches_editor",
         )
