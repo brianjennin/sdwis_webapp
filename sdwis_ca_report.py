@@ -1,7 +1,9 @@
 # sdwis_ca_report.py — imports
 import sys
+import io
 import re
 import functools
+from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -302,6 +304,157 @@ def pull_rows_filtered(table: str, col: str, val: str,
     if not parts:
         return pd.DataFrame()
     return df_upper(pd.concat(parts, ignore_index=True))
+
+# ----------------------- Targeted (server-side) search -----------------------
+#
+# The bulk pull_rows_* helpers above fetch an ENTIRE state and filter locally,
+# which costs up to MAX_PAGES x PAGE_SIZE rows per table before the user has
+# typed anything. The helpers below push the filter into the Envirofacts URL,
+# so a search transfers only matching rows.
+#
+# Envirofacts chains column filters in the path and supports comparison
+# operators, e.g.
+#     /WATER_SYSTEM/STATE_CODE/CA/PWS_NAME/CONTAINING/porterville/CSV
+#
+# IMPORTANT: the CONTAINING operator has NOT been verified against the live
+# service (data.epa.gov was unreachable from the environment this was written
+# in). Every targeted query therefore raises on failure so the caller can fall
+# back to the bulk path -- worst case is the previous behaviour, not a search
+# that silently returns nothing.
+
+SEARCH_PAGE_SIZE = 5000
+SEARCH_MAX_PAGES = 4
+
+
+def _ef_path(table: str, filters: list[tuple]) -> str:
+    """Build an Envirofacts path: (col, val) or (col, operator, val) pairs."""
+    parts = [table]
+    for f in filters:
+        if len(f) == 2:
+            col, val = f
+            parts += [col, quote(str(val), safe="")]
+        else:
+            col, op, val = f
+            parts += [col, op, quote(str(val), safe="")]
+    return "/".join(parts)
+
+
+def _ef_page(url_without_format: str) -> pd.DataFrame:
+    """Fetch one page, preferring CSV (far smaller than JSON for the same rows).
+
+    JSON repeats every column name on every row; for a 20k-row WATER_SYSTEM
+    pull that is most of the payload. Falls back to JSON if CSV is refused.
+    """
+    last_error = None
+    for fmt in ("CSV", "JSON"):
+        try:
+            r = _session.get(f"{url_without_format}/{fmt}", timeout=60)
+            r.raise_for_status()
+            if fmt == "CSV":
+                text = r.text.lstrip()
+                if text.startswith("<"):
+                    raise ValueError("CSV endpoint returned markup, not CSV")
+                return pd.read_csv(io.StringIO(text), dtype=str, low_memory=False)
+            data = r.json()
+            return pd.DataFrame(data) if isinstance(data, list) and data else pd.DataFrame()
+        except Exception as e:  # noqa: BLE001 - any failure means try the next format
+            last_error = e
+    raise RuntimeError(f"Envirofacts query failed: {url_without_format} ({last_error})")
+
+
+def ef_query(table: str, filters: list[tuple],
+             page_size: int = SEARCH_PAGE_SIZE,
+             max_pages: int = SEARCH_MAX_PAGES) -> pd.DataFrame:
+    """Run a filtered Envirofacts query. Raises so callers can fall back.
+
+    Unlike pull_rows_filtered, this stops as soon as a short page comes back
+    instead of always spending one extra round trip discovering an empty page.
+    """
+    path = _ef_path(table, filters)
+    frames = []
+    for p in range(max_pages):
+        start = p * page_size
+        end = start + page_size - 1
+        df = _ef_page(f"{BASE}/{path}/Rows/{start}:{end}")
+        if df.empty:
+            break
+        frames.append(df)
+        if len(df) < page_size:
+            break
+    if not frames:
+        return pd.DataFrame()
+    return df_upper(pd.concat(frames, ignore_index=True))
+
+
+def search_systems_targeted(state: str, name_query: str | None,
+                            county_or_city: str | None) -> pd.DataFrame:
+    """Server-side system search. Raises if it cannot be satisfied narrowly.
+
+    Only a name query can narrow WATER_SYSTEM, because county lives on
+    GEOGRAPHIC_AREA. A county-only search still needs the full state list of
+    system names, so it is left to the caller's bulk path.
+    """
+    sc = (state or "").strip().upper()
+    name = (name_query or "").strip()
+    place = (county_or_city or "").strip()
+
+    if not re.fullmatch(r"[A-Z]{2}", sc):
+        raise ValueError(f"bad state code: {state!r}")
+    if not name:
+        raise ValueError("targeted search needs a system name to narrow on")
+
+    # Chain one name token server-side -- the longest, as the most selective --
+    # then AND any remaining tokens locally over the small result.
+    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", name) if t]
+    if not tokens:
+        raise ValueError("no usable name tokens")
+    lead = max(tokens, key=len)
+
+    ws = ef_query("WATER_SYSTEM", [
+        ("STATE_CODE", sc),
+        ("PWS_NAME", "CONTAINING", lead.upper()),
+    ])
+    if ws.empty or "PWSID" not in ws.columns:
+        return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
+
+    keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
+    ws = ws[keep].drop_duplicates("PWSID")
+
+    remaining = [t for t in tokens if t != lead]
+    if remaining and "PWS_NAME" in ws.columns:
+        ws = ws[token_and_contains(ws["PWS_NAME"], remaining)]
+
+    ws["CITY"] = ws.get("CITY_NAME", pd.Series([""] * len(ws), index=ws.index)) \
+                   .fillna("").astype(str).str.strip()
+    ws["COUNTY_SERVED"] = ""
+
+    if place and not ws.empty:
+        # Only the matched systems need a geography lookup, and there are few
+        # of them now, so filter GEOGRAPHIC_AREA server-side by the same state
+        # and intersect on PWSID.
+        ga = ef_query("GEOGRAPHIC_AREA", [
+            ("STATE_SERVED", sc),
+            ("COUNTY_SERVED", "CONTAINING", place.upper()),
+        ])
+        if ga.empty:
+            ga = ef_query("GEOGRAPHIC_AREA", [
+                ("STATE_SERVED", sc),
+                ("CITY_SERVED", "CONTAINING", place.upper()),
+            ])
+        if ga.empty or "PWSID" not in ga.columns:
+            return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
+
+        cols = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
+        ga = ga[cols].drop_duplicates("PWSID")
+        ws = ws.drop(columns=["COUNTY_SERVED"]).merge(ga, on="PWSID", how="inner")
+        if "CITY_SERVED" in ws.columns:
+            ws["CITY"] = ws["CITY"].mask(
+                ws["CITY"].eq(""), ws["CITY_SERVED"].fillna("").astype(str).str.strip()
+            )
+
+    out = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in ws.columns]
+    return ws[out].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
+
 
 def looks_like_pwsid(s: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z]{2}\d{7}", s.strip()))

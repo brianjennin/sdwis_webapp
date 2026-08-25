@@ -1,7 +1,9 @@
-# app.py — Preload WS + GA for each state, then filter locally
-# - On first state selection: fetch full WATER_SYSTEM + GEOGRAPHIC_AREA once
-# - All searches afterwards are in-memory pandas filters (instant)
-# - Word report generation still per-PWSID via cached_fetch_all_selected
+# app.py — Fetch only what a search actually needs
+# - Selecting a state fetches nothing
+# - PWSID lookups go straight to that system; no state data is touched
+# - A name search is filtered server-side and returns only matching rows
+# - The full-state pull is still available, but only on request, or as a
+#   fallback when a targeted query fails
 
 import os
 import re
@@ -18,6 +20,7 @@ from sdwis_ca_report import (
     pull_rows_filtered,
     df_upper,
     token_and_contains,
+    search_systems_targeted,
 )
 
 st.set_page_config(page_title="SDWIS – Report Generator (All States)", layout="centered")
@@ -31,6 +34,11 @@ STATES = [
 ]
 
 # ---------------- Caching ----------------
+#
+# The two by-state pulls below are the expensive path: each walks
+# WATER_SYSTEM / GEOGRAPHIC_AREA for a whole state. They are no longer called
+# on state selection -- only when a search genuinely needs the full list
+# (a county-only search, or a targeted query that failed).
 
 @st.cache_data(ttl=60*60*12)  # 12 hours, persisted in memory/disk
 def get_ga_by_state(state: str) -> pd.DataFrame:
@@ -55,12 +63,15 @@ def cached_fetch_all_selected(pwsid: str):
     """Cache per-system tables for report generation."""
     return fetch_all_selected(pwsid)
 
+@st.cache_data(ttl=60*60*12, max_entries=200, show_spinner=False)
+def cached_targeted_search(state: str, name: str, place: str) -> pd.DataFrame:
+    """Server-side filtered search; raises on failure so the caller can fall back."""
+    return search_systems_targeted(state, name or None, place or None)
+
 # ---------------- Search helpers ----------------
 
-def fast_search(state: str, name_query: str, county_or_city: str | None) -> pd.DataFrame:
-    """
-    All searches are local pandas filters on preloaded WS + GA.
-    """
+def bulk_search(state: str, name_query: str, county_or_city: str | None) -> pd.DataFrame:
+    """Full-state pull, then local pandas filters. The expensive path."""
     sc = (state or "").strip().upper()
     ws = get_ws_by_state(sc)
     ga = get_ga_by_state(sc)
@@ -100,16 +111,34 @@ def fast_search(state: str, name_query: str, county_or_city: str | None) -> pd.D
     cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in df.columns]
     return df[cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
+
+def run_search(state: str, name_query: str, county_or_city: str | None):
+    """Search with the cheapest method that can answer the question.
+
+    Returns (results, how) where `how` explains which path ran, so the cost of
+    a search is visible in the UI rather than hidden.
+    """
+    name = (name_query or "").strip()
+    place = (county_or_city or "").strip()
+
+    if name:
+        try:
+            return cached_targeted_search(state, name, place), "targeted"
+        except Exception as e:  # operator unsupported, service error, etc.
+            return bulk_search(state, name, place or None), f"fallback ({e.__class__.__name__})"
+
+    # No name to narrow on: the full state list is genuinely required.
+    return bulk_search(state, name, place or None), "full-state"
+
+
 # ---------------- UI ----------------
 
 state = st.selectbox("State", STATES, index=STATES.index("CA") if "CA" in STATES else 0)
 
-# Preload GA + WS cache for this state
-with st.spinner(f"Loading all systems for {state} (first time may take up to a minute)…"):
-    ga = get_ga_by_state(state)
-    ws = get_ws_by_state(state)
-
-st.success(f"{len(ws):,} water systems cached for {state}. Searches are now instant.")
+st.caption(
+    "Searching by system name is fastest — only matching rows are transferred. "
+    "A county- or city-only search has to pull the full state list."
+)
 
 mode = st.radio("Lookup by", ["PWSID", "Name / County or City"], horizontal=True)
 pwsid_to_generate: str | None = None
@@ -137,9 +166,14 @@ else:
             if not name.strip() and not county_city.strip():
                 st.warning("Enter a system name, OR a county/city.")
             else:
-                with st.spinner(f"Filtering {state} systems…"):
-                    matches = fast_search(state, name, county_city or None)
+                with st.spinner(f"Searching {state}…"):
+                    matches, how = run_search(state, name, county_city or None)
                 st.session_state.matches = None if matches.empty else matches.reset_index(drop=True)
+                st.session_state.search_how = how
+                if how == "full-state":
+                    st.info("Pulled the full state list. Add a system name to make this much faster.")
+                elif how.startswith("fallback"):
+                    st.warning(f"Targeted search unavailable, used the full-state pull — {how}.")
 
     # Show results + in-table single selection
     if st.session_state.matches is not None:
