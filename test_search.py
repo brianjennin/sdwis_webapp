@@ -107,6 +107,46 @@ def test_place_only_search_never_pulls_the_whole_state():
     assert all(s.complete for s in stats)
 
 
+def test_out_of_state_rows_are_dropped():
+    """Envirofacts ignored the chained STATE filter: a CA city search returned
+    Arizona and Idaho systems. The state must be re-checked client-side."""
+    leaky = (
+        "PWSID,PWS_NAME,CITY_NAME,STATE_CODE\n"
+        "CA3110008,CITY OF ROSEVILLE,ROSEVILLE,CA\n"
+        "AZ0415033,RV TRADERS,ROSEVILLE,AZ\n"
+        "ID5420024,ROCK CREEK MOBILE MANOR,ROSEVILLE,ID\n"
+    )
+
+    def get(url, timeout=None):
+        if not url.endswith("/CSV") or "Rows/0:" not in url:
+            return _Resp("")
+        return _Resp("PWSID,CITY_SERVED,COUNTY_SERVED\n" if "GEOGRAPHIC_AREA" in url else leaky)
+
+    R._session = types.SimpleNamespace(get=get)
+    out, stats = R.search_systems_targeted("CA", None, "roseville")
+    assert out["PWSID"].tolist() == ["CA3110008"], out["PWSID"].tolist()
+    assert any("ignored the STATE filter" in s.reason for s in stats), \
+        [s.describe() for s in stats]
+
+
+def test_county_is_populated_from_geographic_area():
+    """COUNTY_SERVED came back blank on every row: the GA columns were dropped."""
+    def get(url, timeout=None):
+        if not url.endswith("/CSV") or "Rows/0:" not in url:
+            return _Resp("")
+        if "GEOGRAPHIC_AREA" in url and "COUNTY_SERVED/CONTAINING" in url:
+            return _Resp("PWSID,CITY_SERVED,COUNTY_SERVED\nCA3110008,ROSEVILLE,PLACER\n")
+        if "GEOGRAPHIC_AREA" in url:
+            return _Resp("PWSID,CITY_SERVED,COUNTY_SERVED\n")
+        return _Resp("PWSID,PWS_NAME,CITY_NAME,STATE_CODE\n"
+                     "CA3110008,CITY OF ROSEVILLE,ROSEVILLE,CA\n")
+
+    R._session = types.SimpleNamespace(get=get)
+    out, _ = R.search_systems_targeted("CA", None, "placer")
+    assert out.iloc[0]["COUNTY_SERVED"] == "PLACER", out.to_dict("records")
+    assert out.iloc[0]["MATCHED_ON"] == "county", out.iloc[0]["MATCHED_ON"]
+
+
 def test_no_criteria_raises_so_caller_falls_back():
     R._session = _stub([])
     try:
