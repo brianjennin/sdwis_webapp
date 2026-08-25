@@ -40,23 +40,39 @@ STATES = [
 # on state selection -- only when a search genuinely needs the full list
 # (a county-only search, or a targeted query that failed).
 
-@st.cache_data(ttl=60*60*12)  # 12 hours, persisted in memory/disk
-def get_ga_by_state(state: str) -> pd.DataFrame:
+def get_ga_by_state(state: str, stats: list) -> pd.DataFrame:
     """Fetch GEOGRAPHIC_AREA by STATE_SERVED; keep city/county columns."""
-    ga = pull_rows_filtered("GEOGRAPHIC_AREA", "STATE_SERVED", (state or "").upper())
+    ga = _ga_by_state_cached((state or "").upper())
+    stats.extend(ga.attrs.get("stats", []))
+    return ga
+
+@st.cache_data(ttl=60*60*12)  # 12 hours, persisted in memory/disk
+def _ga_by_state_cached(state: str) -> pd.DataFrame:
+    stats: list = []
+    ga = pull_rows_filtered("GEOGRAPHIC_AREA", "STATE_SERVED", (state or "").upper(), stats=stats)
     ga = df_upper(ga)
     keep = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED", "STATE_SERVED"] if c in ga.columns]
     ga = ga[keep] if keep else ga
     subset = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
-    return ga.drop_duplicates(subset=subset) if subset else ga.drop_duplicates()
+    out = ga.drop_duplicates(subset=subset) if subset else ga.drop_duplicates()
+    out.attrs["stats"] = stats
+    return out
+
+def get_ws_by_state(state: str, stats: list) -> pd.DataFrame:
+    """Fetch WATER_SYSTEM by STATE_CODE; keep minimal columns."""
+    ws = _ws_by_state_cached((state or "").upper())
+    stats.extend(ws.attrs.get("stats", []))
+    return ws
 
 @st.cache_data(ttl=60*60*12)  # 12 hours
-def get_ws_by_state(state: str) -> pd.DataFrame:
-    """Fetch WATER_SYSTEM by STATE_CODE; keep minimal columns."""
-    ws = pull_rows_filtered("WATER_SYSTEM", "STATE_CODE", (state or "").upper())
+def _ws_by_state_cached(state: str) -> pd.DataFrame:
+    stats: list = []
+    ws = pull_rows_filtered("WATER_SYSTEM", "STATE_CODE", (state or "").upper(), stats=stats)
     ws = df_upper(ws)
     keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
-    return ws[keep].drop_duplicates("PWSID") if keep else ws
+    out = ws[keep].drop_duplicates("PWSID") if keep else ws
+    out.attrs["stats"] = stats
+    return out
 
 @st.cache_data(ttl=60*60*12, max_entries=300)
 def cached_fetch_all_selected(pwsid: str):
@@ -64,20 +80,26 @@ def cached_fetch_all_selected(pwsid: str):
     return fetch_all_selected(pwsid)
 
 @st.cache_data(ttl=60*60*12, max_entries=200, show_spinner=False)
-def cached_targeted_search(state: str, name: str, place: str) -> pd.DataFrame:
+def cached_targeted_search(state: str, name: str, place: str):
     """Server-side filtered search; raises on failure so the caller can fall back."""
     return search_systems_targeted(state, name or None, place or None)
 
 # ---------------- Search helpers ----------------
 
-def bulk_search(state: str, name_query: str, county_or_city: str | None) -> pd.DataFrame:
-    """Full-state pull, then local pandas filters. The expensive path."""
+def bulk_search(state: str, name_query: str, county_or_city: str | None):
+    """Full-state pull, then local pandas filters. The expensive path.
+
+    Returns (results, stats). The stats matter here more than anywhere else:
+    this path inner-joins WATER_SYSTEM against GEOGRAPHIC_AREA, so if either
+    pull came back short the join silently drops real matches.
+    """
     sc = (state or "").strip().upper()
-    ws = get_ws_by_state(sc)
-    ga = get_ga_by_state(sc)
+    stats = []
+    ws = get_ws_by_state(sc, stats)
+    ga = get_ga_by_state(sc, stats)
 
     if ws.empty:
-        return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
+        return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"]), stats
 
     # Add CITY column from WS
     df = ws.copy()
@@ -99,7 +121,7 @@ def bulk_search(state: str, name_query: str, county_or_city: str | None) -> pd.D
         ga_match = ga[m_county | m_citysv]
 
         if ga_match.empty:
-            return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
+            return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"]), stats
 
         df = df.merge(
             ga_match[["PWSID", "CITY_SERVED", "COUNTY_SERVED"]].drop_duplicates("PWSID"),
@@ -109,7 +131,7 @@ def bulk_search(state: str, name_query: str, county_or_city: str | None) -> pd.D
         df["CITY"] = df["CITY"].mask(df["CITY"].eq(""), df["CITY_SERVED"].fillna("").astype(str).str.strip())
 
     cols = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in df.columns]
-    return df[cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
+    return df[cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True), stats
 
 
 def run_search(state: str, name_query: str, county_or_city: str | None):
@@ -121,14 +143,16 @@ def run_search(state: str, name_query: str, county_or_city: str | None):
     name = (name_query or "").strip()
     place = (county_or_city or "").strip()
 
-    if name:
+    if name or place:
         try:
-            return cached_targeted_search(state, name, place), "targeted"
+            results, stats = cached_targeted_search(state, name, place)
+            return results, "targeted", stats
         except Exception as e:  # operator unsupported, service error, etc.
-            return bulk_search(state, name, place or None), f"fallback ({e.__class__.__name__})"
+            results, stats = bulk_search(state, name, place or None)
+            return results, f"fallback ({e.__class__.__name__}: {e})", stats
 
-    # No name to narrow on: the full state list is genuinely required.
-    return bulk_search(state, name, place or None), "full-state"
+    results, stats = bulk_search(state, name, place or None)
+    return results, "full-state", stats
 
 
 # ---------------- UI ----------------
@@ -136,8 +160,8 @@ def run_search(state: str, name_query: str, county_or_city: str | None):
 state = st.selectbox("State", STATES, index=STATES.index("CA") if "CA" in STATES else 0)
 
 st.caption(
-    "Searching by system name is fastest — only matching rows are transferred. "
-    "A county- or city-only search has to pull the full state list."
+    "Name, county and city searches are all filtered server-side — only "
+    "matching rows are transferred."
 )
 
 mode = st.radio("Lookup by", ["PWSID", "Name / County or City"], horizontal=True)
@@ -167,17 +191,43 @@ else:
                 st.warning("Enter a system name, OR a county/city.")
             else:
                 with st.spinner(f"Searching {state}…"):
-                    matches, how = run_search(state, name, county_city or None)
+                    matches, how, stats = run_search(state, name, county_city or None)
                 st.session_state.matches = None if matches.empty else matches.reset_index(drop=True)
                 st.session_state.search_how = how
-                if how == "full-state":
-                    st.info("Pulled the full state list. Add a system name to make this much faster.")
-                elif how.startswith("fallback"):
-                    st.warning(f"Targeted search unavailable, used the full-state pull — {how}.")
+                st.session_state.search_stats = stats
 
     # Show results + in-table single selection
     if st.session_state.matches is not None:
         st.subheader("Matches")
+
+        how = st.session_state.get("search_how", "")
+        stats = st.session_state.get("search_stats", []) or []
+        incomplete = [s for s in stats if not s.complete]
+
+        if incomplete:
+            st.error(
+                "This result is INCOMPLETE — at least one query did not return "
+                "everything the service holds, so systems are missing. See "
+                "'How this result was fetched' below."
+            )
+        if how == "full-state":
+            st.info("Pulled the full state list — the slow path.")
+        elif how.startswith("fallback"):
+            st.warning(f"Targeted search unavailable, fell back to the full-state pull — {how}")
+
+        with st.expander("How this result was fetched", expanded=bool(incomplete)):
+            st.write(f"Path: **{how}**")
+            if stats:
+                for s in stats:
+                    (st.error if not s.complete else st.write)(s.describe())
+                st.caption(
+                    "Every query above must say 'complete'. 'INCOMPLETE' means the "
+                    "row-page cap was hit or a page errored, and the matches below "
+                    "are a subset of what actually exists."
+                )
+            else:
+                st.write("No fetch recorded (results served from cache).")
+
         df = st.session_state.matches.copy()
 
         # Quick local filter

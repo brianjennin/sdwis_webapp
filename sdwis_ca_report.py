@@ -3,6 +3,7 @@ import sys
 import io
 import re
 import functools
+from dataclasses import dataclass
 from urllib.parse import quote
 
 import requests
@@ -267,43 +268,84 @@ def df_upper(df: pd.DataFrame) -> pd.DataFrame:
     out.columns = [c.upper() for c in out.columns]
     return out
 
-def pull_rows_paged(table: str, page_size: int = PAGE_SIZE, max_pages: int = MAX_PAGES) -> pd.DataFrame:
+@dataclass
+class FetchStats:
+    """What one paged pull actually managed to retrieve.
+
+    `complete` is the important field: False means the result is a PREFIX of
+    the real answer, because a page errored or the page cap was reached. The
+    previous implementation swallowed both cases and returned partial data
+    that looked complete, which silently shrank search results.
+    """
+    label: str
+    rows: int = 0
+    pages: int = 0
+    complete: bool = True
+    reason: str = ""
+
+    def describe(self) -> str:
+        status = "complete" if self.complete else f"INCOMPLETE - {self.reason}"
+        return f"{self.label}: {self.rows:,} rows in {self.pages} page(s), {status}"
+
+
+def _paged_pull(url_template: str, label: str, page_size: int, max_pages: int,
+                stats: list | None = None, **fmt) -> pd.DataFrame:
+    """Page through an Envirofacts row window, recording completeness.
+
+    Row windows are INCLUSIVE at both ends, so a page is start..start+size-1.
+    The original code used start+size, which re-fetched one row per page.
+    """
     parts = []
+    stat = FetchStats(label=label)
+    hit_cap = True
+
     for p in range(max_pages):
         start = p * page_size
-        end = start + page_size
-        url = ROWS_URL.format(table=table, start=start, end=end)
+        end = start + page_size - 1
+        url = url_template.format(start=start, end=end, **fmt)
         try:
             data = api_get_json(url)
-            if not isinstance(data, list) or not data:
-                break
-            parts.append(pd.DataFrame(data))
         except Exception as e:
-            print(f"[Rows {table} {start}:{end}] {e}")
+            stat.complete = False
+            stat.reason = f"page {start}-{end} failed ({type(e).__name__}: {e})"
+            hit_cap = False
             break
+
+        if not isinstance(data, list) or not data:
+            hit_cap = False
+            break
+
+        parts.append(pd.DataFrame(data))
+        stat.pages += 1
+        stat.rows += len(data)
+        if len(data) < page_size:
+            hit_cap = False
+            break
+
+    if hit_cap:
+        stat.complete = False
+        stat.reason = (f"stopped at the {max_pages}-page cap "
+                       f"({max_pages * page_size:,} rows); more rows exist")
+
+    if stats is not None:
+        stats.append(stat)
     if not parts:
         return pd.DataFrame()
     return df_upper(pd.concat(parts, ignore_index=True))
 
+
+def pull_rows_paged(table: str, page_size: int = PAGE_SIZE, max_pages: int = MAX_PAGES,
+                    stats: list | None = None) -> pd.DataFrame:
+    return _paged_pull(ROWS_URL, f"{table} (all rows)", page_size, max_pages,
+                       stats=stats, table=table)
+
+
 def pull_rows_filtered(table: str, col: str, val: str,
-                       page_size: int = PAGE_SIZE, max_pages: int = MAX_PAGES) -> pd.DataFrame:
+                       page_size: int = PAGE_SIZE, max_pages: int = MAX_PAGES,
+                       stats: list | None = None) -> pd.DataFrame:
     """Pull rows from EPA API with a server-side filter to reduce data size."""
-    parts = []
-    for p in range(max_pages):
-        start = p * page_size
-        end = start + page_size
-        url = FILTER_URL.format(table=table, col=col, val=val, start=start, end=end)
-        try:
-            data = api_get_json(url)
-            if not isinstance(data, list) or not data:
-                break
-            parts.append(pd.DataFrame(data))
-        except Exception as e:
-            print(f"[Rows {table} {start}:{end}] {e}")
-            break
-    if not parts:
-        return pd.DataFrame()
-    return df_upper(pd.concat(parts, ignore_index=True))
+    return _paged_pull(FILTER_URL, f"{table} where {col}={val}", page_size, max_pages,
+                       stats=stats, table=table, col=col, val=val)
 
 # ----------------------- Targeted (server-side) search -----------------------
 #
@@ -364,96 +406,173 @@ def _ef_page(url_without_format: str) -> pd.DataFrame:
 
 def ef_query(table: str, filters: list[tuple],
              page_size: int = SEARCH_PAGE_SIZE,
-             max_pages: int = SEARCH_MAX_PAGES) -> pd.DataFrame:
+             max_pages: int = SEARCH_MAX_PAGES,
+             stats: list | None = None) -> pd.DataFrame:
     """Run a filtered Envirofacts query. Raises so callers can fall back.
 
     Unlike pull_rows_filtered, this stops as soon as a short page comes back
     instead of always spending one extra round trip discovering an empty page.
     """
     path = _ef_path(table, filters)
+    stat = FetchStats(label=path)
     frames = []
+    hit_cap = True
     for p in range(max_pages):
         start = p * page_size
         end = start + page_size - 1
         df = _ef_page(f"{BASE}/{path}/Rows/{start}:{end}")
         if df.empty:
+            hit_cap = False
             break
         frames.append(df)
+        stat.pages += 1
+        stat.rows += len(df)
         if len(df) < page_size:
+            hit_cap = False
             break
+    if hit_cap:
+        stat.complete = False
+        stat.reason = f"stopped at the {max_pages}-page cap ({max_pages * page_size:,} rows)"
+    if stats is not None:
+        stats.append(stat)
     if not frames:
         return pd.DataFrame()
     return df_upper(pd.concat(frames, ignore_index=True))
 
 
+def ef_systems_by_pwsid(pwsids: list[str], chunk: int = 40, max_chunks: int = 25,
+                        stats: list | None = None) -> pd.DataFrame:
+    """Fetch WATER_SYSTEM rows for a specific set of PWSIDs.
+
+    Uses the IN operator so a set of ids costs one request per chunk rather
+    than one per system. If IN is unsupported the underlying query raises and
+    the caller falls back to the bulk state pull.
+    """
+    frames = []
+    capped = len(pwsids) > chunk * max_chunks
+    for i in range(0, min(len(pwsids), chunk * max_chunks), chunk):
+        ids = ",".join(pwsids[i:i + chunk])
+        df = ef_query("WATER_SYSTEM", [("PWSID", "IN", ids)], stats=stats)
+        if not df.empty:
+            frames.append(df)
+    if capped and stats is not None:
+        stats.append(FetchStats(
+            label="WATER_SYSTEM by PWSID", rows=0, pages=0, complete=False,
+            reason=f"{len(pwsids):,} systems matched but only "
+                   f"{chunk * max_chunks:,} were looked up",
+        ))
+    if not frames:
+        return pd.DataFrame()
+    return df_upper(pd.concat(frames, ignore_index=True))
+
+
+EMPTY_RESULT_COLUMNS = ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"]
+
+
+def _empty_result() -> pd.DataFrame:
+    return pd.DataFrame(columns=EMPTY_RESULT_COLUMNS)
+
+
+def _tidy(ws: pd.DataFrame) -> pd.DataFrame:
+    """Normalise a WATER_SYSTEM frame to the columns the results table shows."""
+    if ws.empty or "PWSID" not in ws.columns:
+        return _empty_result()
+    out = ws.copy()
+    if "CITY" not in out.columns:
+        out["CITY"] = out.get("CITY_NAME", pd.Series([""] * len(out), index=out.index))
+    out["CITY"] = out["CITY"].fillna("").astype(str).str.strip()
+    if "COUNTY_SERVED" not in out.columns:
+        out["COUNTY_SERVED"] = ""
+    cols = [c for c in EMPTY_RESULT_COLUMNS if c in out.columns]
+    return out[cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
+
+
+def _pwsids_serving_place(sc: str, place: str, stats: list) -> list[str]:
+    """PWSIDs whose GEOGRAPHIC_AREA row matches a county OR a served city.
+
+    WATER_SYSTEM.CITY_NAME is the system's own (often administrative) city,
+    which is not the same as the city it serves, so both are consulted.
+    """
+    found: list[str] = []
+    for column in ("COUNTY_SERVED", "CITY_SERVED"):
+        ga = ef_query("GEOGRAPHIC_AREA", [
+            ("STATE_SERVED", sc),
+            (column, "CONTAINING", place.upper()),
+        ], stats=stats)
+        if not ga.empty and "PWSID" in ga.columns:
+            found.extend(ga["PWSID"].dropna().astype(str).tolist())
+    return list(dict.fromkeys(found))
+
+
 def search_systems_targeted(state: str, name_query: str | None,
-                            county_or_city: str | None) -> pd.DataFrame:
+                            county_or_city: str | None) -> tuple[pd.DataFrame, list]:
     """Server-side system search. Raises if it cannot be satisfied narrowly.
 
-    Only a name query can narrow WATER_SYSTEM, because county lives on
-    GEOGRAPHIC_AREA. A county-only search still needs the full state list of
-    system names, so it is left to the caller's bulk path.
+    Returns (results, stats) so the caller can show what was actually fetched
+    and whether any part of it came back incomplete.
+
+    A place-only search does NOT need the full state list: WATER_SYSTEM can be
+    filtered on CITY_NAME directly, and GEOGRAPHIC_AREA carries county and
+    served-city, so both sides can be narrowed server-side and unioned.
     """
     sc = (state or "").strip().upper()
     name = (name_query or "").strip()
     place = (county_or_city or "").strip()
+    stats: list = []
 
     if not re.fullmatch(r"[A-Z]{2}", sc):
         raise ValueError(f"bad state code: {state!r}")
-    if not name:
-        raise ValueError("targeted search needs a system name to narrow on")
+    if not name and not place:
+        raise ValueError("targeted search needs a system name or a place")
 
-    # Chain one name token server-side -- the longest, as the most selective --
-    # then AND any remaining tokens locally over the small result.
-    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", name) if t]
-    if not tokens:
-        raise ValueError("no usable name tokens")
-    lead = max(tokens, key=len)
+    if name:
+        # Chain one name token server-side -- the longest, as the most
+        # selective -- then AND any remaining tokens locally.
+        tokens = [t for t in re.findall(r"[A-Za-z0-9]+", name) if t]
+        if not tokens:
+            raise ValueError("no usable name tokens")
+        lead = max(tokens, key=len)
 
-    ws = ef_query("WATER_SYSTEM", [
+        ws = ef_query("WATER_SYSTEM", [
+            ("STATE_CODE", sc),
+            ("PWS_NAME", "CONTAINING", lead.upper()),
+        ], stats=stats)
+        if ws.empty or "PWSID" not in ws.columns:
+            return _empty_result(), stats
+
+        keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
+        ws = ws[keep].drop_duplicates("PWSID")
+        remaining = [t for t in tokens if t != lead]
+        if remaining and "PWS_NAME" in ws.columns:
+            ws = ws[token_and_contains(ws["PWS_NAME"], remaining)]
+
+        if not place:
+            return _tidy(ws), stats
+
+        ids = set(_pwsids_serving_place(sc, place, stats))
+        if not ids:
+            return _empty_result(), stats
+        return _tidy(ws[ws["PWSID"].astype(str).isin(ids)]), stats
+
+    # Place only. Union of systems whose own city matches and systems whose
+    # GEOGRAPHIC_AREA row names the place.
+    by_city = ef_query("WATER_SYSTEM", [
         ("STATE_CODE", sc),
-        ("PWS_NAME", "CONTAINING", lead.upper()),
-    ])
-    if ws.empty or "PWSID" not in ws.columns:
-        return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
+        ("CITY_NAME", "CONTAINING", place.upper()),
+    ], stats=stats)
 
-    keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
-    ws = ws[keep].drop_duplicates("PWSID")
+    known = set(by_city["PWSID"].astype(str)) if "PWSID" in by_city.columns else set()
+    extra = [i for i in _pwsids_serving_place(sc, place, stats) if i not in known]
 
-    remaining = [t for t in tokens if t != lead]
-    if remaining and "PWS_NAME" in ws.columns:
-        ws = ws[token_and_contains(ws["PWS_NAME"], remaining)]
+    frames = [by_city] if not by_city.empty else []
+    if extra:
+        frames.append(ef_systems_by_pwsid(extra, stats=stats))
+    if not frames:
+        return _empty_result(), stats
 
-    ws["CITY"] = ws.get("CITY_NAME", pd.Series([""] * len(ws), index=ws.index)) \
-                   .fillna("").astype(str).str.strip()
-    ws["COUNTY_SERVED"] = ""
-
-    if place and not ws.empty:
-        # Only the matched systems need a geography lookup, and there are few
-        # of them now, so filter GEOGRAPHIC_AREA server-side by the same state
-        # and intersect on PWSID.
-        ga = ef_query("GEOGRAPHIC_AREA", [
-            ("STATE_SERVED", sc),
-            ("COUNTY_SERVED", "CONTAINING", place.upper()),
-        ])
-        if ga.empty:
-            ga = ef_query("GEOGRAPHIC_AREA", [
-                ("STATE_SERVED", sc),
-                ("CITY_SERVED", "CONTAINING", place.upper()),
-            ])
-        if ga.empty or "PWSID" not in ga.columns:
-            return pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"])
-
-        cols = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
-        ga = ga[cols].drop_duplicates("PWSID")
-        ws = ws.drop(columns=["COUNTY_SERVED"]).merge(ga, on="PWSID", how="inner")
-        if "CITY_SERVED" in ws.columns:
-            ws["CITY"] = ws["CITY"].mask(
-                ws["CITY"].eq(""), ws["CITY_SERVED"].fillna("").astype(str).str.strip()
-            )
-
-    out = [c for c in ["PWSID", "PWS_NAME", "CITY", "COUNTY_SERVED"] if c in ws.columns]
-    return ws[out].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
+    combined = pd.concat(frames, ignore_index=True)
+    keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in combined.columns]
+    return _tidy(combined[keep]), stats
 
 
 def looks_like_pwsid(s: str) -> bool:
