@@ -206,11 +206,23 @@ else:
         stats = st.session_state.get("search_stats", []) or []
         incomplete = [s for s in stats if not s.complete]
 
-        if incomplete:
+        # Two different failures, previously conflated under one alarming
+        # banner: a search that missed systems, versus a detail lookup that
+        # failed for a system already listed.
+        search_bad = [s for s in incomplete if "by PWSID" not in s.label]
+        detail_bad = [s for s in incomplete if "by PWSID" in s.label]
+
+        if search_bad:
             st.error(
-                "This result is INCOMPLETE — at least one query did not return "
-                "everything the service holds, so systems are missing. See "
-                "'How this result was fetched' below."
+                "**Systems may be missing.** A search query did not return "
+                "everything the service holds — see 'How this result was "
+                "fetched' below."
+            )
+        if detail_bad:
+            st.warning(
+                "All matching systems are listed, but county could not be "
+                "retrieved for some of them (the per-system lookup failed after "
+                "retries). Those rows show a blank County — re-run to retry."
             )
         if how == "full-state":
             st.info("Pulled the full state list — the slow path.")
@@ -220,12 +232,14 @@ else:
         if "MATCHED_ON" in st.session_state.matches.columns:
             counts = st.session_state.matches["MATCHED_ON"].value_counts()
             serves = int(counts.get("served city", 0) + counts.get("county", 0))
-            mailing = int(counts.get("mailing address only", 0))
+            mailing = int(counts.get("system address", 0))
             if mailing:
                 st.caption(
-                    f"**{serves}** system(s) actually serve this place; "
-                    f"**{mailing}** matched only the operator's mailing address. "
-                    "Sort or filter on 'Matched on' to separate them."
+                    f"All **{len(st.session_state.matches)}** matching systems are "
+                    f"listed. SDWIS confirms **{serves}** as serving this place; "
+                    f"the other **{mailing}** matched on the system's own address. "
+                    "SDWIS records served-city sparsely, so that is not proof they "
+                    "don't serve it — use the County column to judge."
                 )
 
         with st.expander("How this result was fetched", expanded=bool(incomplete)):
@@ -287,9 +301,9 @@ else:
                     "Matched on",
                     help="Why this system is in the list, from its SDWIS "
                          "geographic-area record. 'served city' and 'county' "
-                         "mean it genuinely serves the place. 'mailing address "
-                         "only' means just the operator's address matched — the "
-                         "system itself may be hundreds of miles away.",
+                         "are confirmed by SDWIS. 'system address' means the "
+                         "system's own address matched — check the County "
+                         "column, since SDWIS records served-city sparsely.",
                 ),
             },
             key="matches_editor",
