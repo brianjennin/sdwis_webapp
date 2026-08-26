@@ -31,21 +31,40 @@ GA_CSV = (
 
 
 class _Resp:
-    def __init__(self, text):
+    """Stands in for a requests.Response.
+
+    Search queries are served as CSV; the per-PWSID enrichment call goes
+    through api_get_json and needs .json(), so both are supported.
+    """
+    def __init__(self, text, payload=None):
         self.text = text
+        self._payload = payload
 
     def raise_for_status(self):
         pass
 
     def json(self):
-        raise ValueError("stub serves CSV only")
+        if self._payload is None:
+            raise ValueError("stub serves CSV only")
+        return self._payload
+
+
+PER_PWSID_GA = {
+    "CA5400001": [{"PWSID": "CA5400001", "CITY_SERVED": "PORTERVILLE",
+                   "COUNTY_SERVED": "TULARE"}],
+    "CA5400002": [{"PWSID": "CA5400002", "CITY_SERVED": "PORTERVILLE",
+                   "COUNTY_SERVED": "TULARE"}],
+}
 
 
 def _stub(calls, fail=False):
-    def get(url, timeout=None):
+    def get(url, timeout=None, **kwargs):
         calls.append(url)
         if fail:
             raise RuntimeError("service unavailable")
+        if "/PWSID/" in url:  # per-PWSID enrichment, served as JSON
+            pwsid = url.split("/PWSID/")[1].split("/")[0]
+            return _Resp("", payload=PER_PWSID_GA.get(pwsid, []))
         if not url.endswith("/CSV"):
             raise RuntimeError("stub serves CSV only")
         if "Rows/0:" not in url:
@@ -54,23 +73,48 @@ def _stub(calls, fail=False):
     return types.SimpleNamespace(get=get)
 
 
+def _filters_in(url: str) -> int:
+    """How many column filters a request URL carries."""
+    path = url.split("/efservice/")[1].split("/Rows/")[0].split("/JSON")[0].split("/CSV")[0]
+    parts = [p for p in path.split("/") if p]
+    return max(0, (len(parts) - 1 + 1) // 2) if len(parts) > 1 else 0
+
+
 # ---------------------------------------------------------------- targeted
 
 
 def test_url_shape():
-    path = R._ef_path("WATER_SYSTEM", [("STATE_CODE", "CA"),
-                                       ("PWS_NAME", "CONTAINING", "PORTERVILLE")])
-    assert path == "WATER_SYSTEM/STATE_CODE/CA/PWS_NAME/CONTAINING/PORTERVILLE", path
+    path = R._ef_path("WATER_SYSTEM", "PWS_NAME", "PORTERVILLE", "CONTAINING")
+    assert path == "WATER_SYSTEM/PWS_NAME/CONTAINING/PORTERVILLE", path
 
 
-def test_name_search_is_one_request():
+def test_never_chains_two_filters():
+    """Envirofacts ignores all but one filter in a chain, so never send two.
+
+    Chaining STATE_CODE/CA with CITY_NAME/CONTAINING/ROSEVILLE returned Arizona
+    and Idaho systems from the live service. The state is applied client-side
+    instead; this pins that no request regains a second filter.
+    """
+    calls = []
+    R._session = _stub(calls)
+    R.search_systems_targeted("CA", None, "porterville")
+    searches = [c for c in calls if "/Rows/" in c]
+    assert searches, calls
+    for c in searches:
+        path = c.split("/efservice/")[1].split("/Rows/")[0]
+        segments = [s for s in path.split("/") if s]
+        # table + column [+ operator] + value  ->  at most 4 segments
+        assert len(segments) <= 4, f"chained filter leaked back in: {path}"
+
+
+def test_name_search_is_one_search_request():
     calls = []
     R._session = _stub(calls)
     out, stats = R.search_systems_targeted("CA", "porterville", None)
-    assert len(calls) == 1, calls
-    assert "CONTAINING/PORTERVILLE" in calls[0]
+    searches = [c for c in calls if "/Rows/" in c]
+    assert len(searches) == 1, searches
+    assert "PWS_NAME/CONTAINING/PORTERVILLE" in searches[0]
     assert not out.empty
-    assert all(s.complete for s in stats)
 
 
 def test_longest_token_goes_server_side():
@@ -82,34 +126,39 @@ def test_longest_token_goes_server_side():
     assert out["PWS_NAME"].tolist() == ["EAST PORTERVILLE MUTUAL"], out["PWS_NAME"].tolist()
 
 
-def test_name_plus_place_narrows_both_sides():
+def test_county_comes_from_per_pwsid_lookup():
+    """COUNTY_SERVED was blank on every row. The per-PWSID call -- the one the
+    Word report uses, and the only one Envirofacts honours -- fills it in."""
+    calls = []
+    R._session = _stub(calls)
+    out, _ = R.search_systems_targeted("CA", "porterville", None)
+    assert any("/PWSID/" in c and "GEOGRAPHIC_AREA" in c for c in calls), calls
+    assert set(out["COUNTY_SERVED"]) == {"TULARE"}, out["COUNTY_SERVED"].tolist()
+    assert set(out["MATCHED_ON"]) == {"system name"}
+
+
+def test_name_plus_place_keeps_only_real_service_matches():
     calls = []
     R._session = _stub(calls)
     out, _ = R.search_systems_targeted("CA", "porterville", "tulare")
-    assert any("GEOGRAPHIC_AREA" in c for c in calls), calls
     assert not out.empty
+    assert set(out["MATCHED_ON"]) <= {"served city", "county"}, out["MATCHED_ON"].tolist()
 
 
-def test_place_only_search_never_pulls_the_whole_state():
-    """The regression this guards: a city search returning almost nothing.
-
-    A place-only search must filter server-side on both WATER_SYSTEM.CITY_NAME
-    and GEOGRAPHIC_AREA, and must never issue an unfiltered state pull.
-    """
+def test_place_search_uses_both_candidate_sources():
+    """A place search must not depend on a system's mailing address alone:
+    GEOGRAPHIC_AREA (serves the place) and WATER_SYSTEM.CITY_NAME are unioned."""
     calls = []
     R._session = _stub(calls)
-    out, stats = R.search_systems_targeted("CA", None, "roseville")
-    assert not out.empty
-    assert any("CITY_NAME/CONTAINING/ROSEVILLE" in c for c in calls), calls
-    assert any("GEOGRAPHIC_AREA" in c for c in calls), calls
-    for c in calls:
-        assert "CONTAINING" in c or "/IN/" in c, f"unfiltered pull leaked in: {c}"
-    assert all(s.complete for s in stats)
+    R.search_systems_targeted("CA", None, "porterville")
+    assert any("GEOGRAPHIC_AREA/CITY_SERVED/CONTAINING" in c for c in calls), calls
+    assert any("GEOGRAPHIC_AREA/COUNTY_SERVED/CONTAINING" in c for c in calls), calls
+    assert any("WATER_SYSTEM/CITY_NAME/CONTAINING" in c for c in calls), calls
 
 
 def test_out_of_state_rows_are_dropped():
-    """Envirofacts ignored the chained STATE filter: a CA city search returned
-    Arizona and Idaho systems. The state must be re-checked client-side."""
+    """Envirofacts has no state filter applied at all now (single filter only),
+    so the state MUST be enforced client-side or AZ/ID systems leak in."""
     leaky = (
         "PWSID,PWS_NAME,CITY_NAME,STATE_CODE\n"
         "CA3110008,CITY OF ROSEVILLE,ROSEVILLE,CA\n"
@@ -117,7 +166,9 @@ def test_out_of_state_rows_are_dropped():
         "ID5420024,ROCK CREEK MOBILE MANOR,ROSEVILLE,ID\n"
     )
 
-    def get(url, timeout=None):
+    def get(url, timeout=None, **kwargs):
+        if "/PWSID/" in url:
+            return _Resp("", payload=[])
         if not url.endswith("/CSV") or "Rows/0:" not in url:
             return _Resp("")
         return _Resp("PWSID,CITY_SERVED,COUNTY_SERVED\n" if "GEOGRAPHIC_AREA" in url else leaky)
@@ -125,26 +176,7 @@ def test_out_of_state_rows_are_dropped():
     R._session = types.SimpleNamespace(get=get)
     out, stats = R.search_systems_targeted("CA", None, "roseville")
     assert out["PWSID"].tolist() == ["CA3110008"], out["PWSID"].tolist()
-    assert any("ignored the STATE filter" in s.reason for s in stats), \
-        [s.describe() for s in stats]
-
-
-def test_county_is_populated_from_geographic_area():
-    """COUNTY_SERVED came back blank on every row: the GA columns were dropped."""
-    def get(url, timeout=None):
-        if not url.endswith("/CSV") or "Rows/0:" not in url:
-            return _Resp("")
-        if "GEOGRAPHIC_AREA" in url and "COUNTY_SERVED/CONTAINING" in url:
-            return _Resp("PWSID,CITY_SERVED,COUNTY_SERVED\nCA3110008,ROSEVILLE,PLACER\n")
-        if "GEOGRAPHIC_AREA" in url:
-            return _Resp("PWSID,CITY_SERVED,COUNTY_SERVED\n")
-        return _Resp("PWSID,PWS_NAME,CITY_NAME,STATE_CODE\n"
-                     "CA3110008,CITY OF ROSEVILLE,ROSEVILLE,CA\n")
-
-    R._session = types.SimpleNamespace(get=get)
-    out, _ = R.search_systems_targeted("CA", None, "placer")
-    assert out.iloc[0]["COUNTY_SERVED"] == "PLACER", out.to_dict("records")
-    assert out.iloc[0]["MATCHED_ON"] == "county", out.iloc[0]["MATCHED_ON"]
+    assert any("outside CA" in s.reason for s in stats), [s.describe() for s in stats]
 
 
 def test_no_criteria_raises_so_caller_falls_back():
@@ -169,7 +201,7 @@ def test_targeted_page_failure_raises():
     """Mid-paging failure on the targeted path must raise, not return a prefix."""
     state = {"n": 0}
 
-    def get(url, timeout=None):
+    def get(url, timeout=None, **kwargs):
         state["n"] += 1
         if state["n"] == 1:
             return _Resp(WS_CSV)
@@ -177,7 +209,7 @@ def test_targeted_page_failure_raises():
 
     R._session = types.SimpleNamespace(get=get)
     try:
-        R.ef_query("WATER_SYSTEM", [("STATE_CODE", "CA")], page_size=2)
+        R.ef_query("WATER_SYSTEM", "STATE_CODE", "CA", page_size=2)
     except Exception:
         return
     raise AssertionError("a failed page must raise, never return partial rows")

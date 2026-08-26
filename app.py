@@ -160,10 +160,10 @@ def run_search(state: str, name_query: str, county_or_city: str | None):
 state = st.selectbox("State", STATES, index=STATES.index("CA") if "CA" in STATES else 0)
 
 st.caption(
-    "Name, county and city searches are filtered server-side — only matching "
-    "rows are transferred. Check the 'Matched on' column: 'served city' and "
-    "'county' are authoritative; 'system city' is the operator's mailing "
-    "address and may be far from the place you searched."
+    "Searches are filtered server-side, then narrowed here. Check the "
+    "'Matched on' column: 'served city' and 'county' mean the system serves "
+    "that place; 'mailing address only' means just the operator's address "
+    "matched."
 )
 
 mode = st.radio("Lookup by", ["PWSID", "Name / County or City"], horizontal=True)
@@ -217,8 +217,25 @@ else:
         elif how.startswith("fallback"):
             st.warning(f"Targeted search unavailable, fell back to the full-state pull — {how}")
 
+        if "MATCHED_ON" in st.session_state.matches.columns:
+            counts = st.session_state.matches["MATCHED_ON"].value_counts()
+            serves = int(counts.get("served city", 0) + counts.get("county", 0))
+            mailing = int(counts.get("mailing address only", 0))
+            if mailing:
+                st.caption(
+                    f"**{serves}** system(s) actually serve this place; "
+                    f"**{mailing}** matched only the operator's mailing address. "
+                    "Sort or filter on 'Matched on' to separate them."
+                )
+
         with st.expander("How this result was fetched", expanded=bool(incomplete)):
             st.write(f"Path: **{how}**")
+            st.caption(
+                "Each request below carries exactly one filter, because "
+                "Envirofacts ignores all but one filter in a chain. The state "
+                "is applied here rather than by the service, and county comes "
+                "from a per-system lookup."
+            )
             if stats:
                 for s in stats:
                     (st.error if not s.complete else st.write)(s.describe())
@@ -268,10 +285,11 @@ else:
                 "COUNTY_SERVED": st.column_config.TextColumn("County"),
                 "MATCHED_ON": st.column_config.TextColumn(
                     "Matched on",
-                    help="Why this system is in the list. 'served city' and "
-                         "'county' come from SDWIS geographic areas and are "
-                         "reliable. 'system city' is the operator's mailing "
-                         "address, which can be far from the place you searched.",
+                    help="Why this system is in the list, from its SDWIS "
+                         "geographic-area record. 'served city' and 'county' "
+                         "mean it genuinely serves the place. 'mailing address "
+                         "only' means just the operator's address matched — the "
+                         "system itself may be hundreds of miles away.",
                 ),
             },
             key="matches_editor",
