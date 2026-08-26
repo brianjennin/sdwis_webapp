@@ -283,6 +283,56 @@ def test_reference_codes_fill_gaps():
     assert R.CODE_DESCRIPTIONS["VIOLATION_CATEGORY_CODE"]["MON"] == "Monitoring Violation"
 
 
+# ------------------------------------------------------- real SDWIS data
+
+
+def _load_fixture(name):
+    import json
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "tests", "fixtures", name)
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_real_facility_data_source_filter():
+    """Golden test against real SDWIS data for CITY OF ROSEVILLE (CA3110008),
+    captured from data.epa.gov.
+
+    34 facility records, 19 flagged IS_SOURCE_IND = 'Y'. The report's Sources
+    table showed exactly 19, which is what makes this a verified baseline
+    rather than an assumption.
+    """
+    rows = _load_fixture("CA3110008_water_system_facility.json")
+    assert len(rows) == 34, len(rows)
+    sources = [r for r in rows if r["is_source_ind"] == "Y"]
+    assert len(sources) == 19, len(sources)
+    # 18 wells + 1 surface intake
+    types = {}
+    for r in sources:
+        types[r["facility_type_code"]] = types.get(r["facility_type_code"], 0) + 1
+    assert types == {"WL": 18, "IN": 1}, types
+
+
+def test_real_facility_codes_all_resolve():
+    """Every code in real data must map to text, or the report prints raw codes.
+
+    'DS' (Distribution System/Zone) had no entry before the reference file was
+    merged in, so CITY OF ROSEVILLE's distribution system rendered as "DS".
+    """
+    rows = _load_fixture("CA3110008_water_system_facility.json")
+    for field, key in (("facility_type_code", "FACILITY_TYPE_CODE"),
+                       ("water_type_code", "WATER_TYPE_CODE"),
+                       ("availability_code", "AVAILABILITY_CODE"),
+                       ("facility_activity_code", "FACILITY_ACTIVITY_CODE"),
+                       ("pws_activity_code", "PWS_ACTIVITY_CODE")):
+        for r in rows:
+            code = r.get(field)
+            if not code:
+                continue
+            assert code in R.CODE_DESCRIPTIONS[key], f"{key} has no entry for {code!r}"
+
+
 def test_no_criteria_raises_so_caller_falls_back():
     R._session = _stub([])
     try:

@@ -279,6 +279,11 @@ def _merge_reference_codes() -> int:
     if not ref:
         return 0
     added = 0
+    # Seed aliased keys the app never hardcoded (e.g. FACILITY_ACTIVITY_CODE,
+    # which is rendered via active_from() but should still resolve by code).
+    for alias, vtype in REF_TYPE_ALIASES.items():
+        if alias not in CODE_DESCRIPTIONS and vtype in ref:
+            CODE_DESCRIPTIONS[alias] = {}
     for key in list(CODE_DESCRIPTIONS):
         vtype = REF_TYPE_ALIASES.get(key, key)
         for code, text in ref.get(vtype, {}).items():
@@ -1065,6 +1070,29 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
 
     # ======================== Facilities ========================
     doc.add_heading("Facilities", level=1)
+
+    # State the coverage. The Sources table lists only IS_SOURCE_IND = 'Y',
+    # so a system's treatment plants and distribution system never appear
+    # there. Verified against SDWIS for CA3110008: 34 facilities, 19 of them
+    # sources -- without this line the other 15 are silently absent and the
+    # reader cannot tell an omission from an empty record.
+    if not wsf.empty and "IS_SOURCE_IND" in wsf.columns:
+        total_fac = len(wsf)
+        n_src = int((wsf["IS_SOURCE_IND"].astype(str).str.upper() == "Y").sum())
+        other = total_fac - n_src
+        summary = f"SDWIS lists {total_fac} facilities for this system: {n_src} source"
+        summary += "" if n_src == 1 else "s"
+        if other:
+            kinds = []
+            if "FACILITY_TYPE_CODE" in wsf.columns:
+                non_src = wsf[wsf["IS_SOURCE_IND"].astype(str).str.upper() != "Y"]
+                for code, n in non_src["FACILITY_TYPE_CODE"].value_counts().items():
+                    kinds.append(f"{n} {desc('FACILITY_TYPE_CODE', code)}")
+            detail = f" ({', '.join(kinds)})" if kinds else ""
+            summary += (f", and {other} non-source facilit"
+                        f"{'y' if other == 1 else 'ies'}{detail} "
+                        "not listed under Sources below")
+        doc.add_paragraph(summary + ".")
 
     # -------- Sources: only IS_SOURCE_IND == 'Y'; sort by type, activity, name
     doc.add_paragraph("Sources")
