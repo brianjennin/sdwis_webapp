@@ -470,6 +470,34 @@ def test_report_renders_from_real_data():
         assert "NAN" not in row[1].upper(), row
 
 
+def test_storage_section_matching_is_warning_free_and_correct():
+    """The storage name fallback used a capturing group in str.contains.
+
+    pandas warns on that (ambiguous with str.extract) and the behaviour of such
+    patterns has shifted across versions. Assert no warning is raised and that
+    the word boundaries still reject near-misses like TANKER and PROTEST.
+    """
+    import warnings
+    import pandas as pd
+
+    names = pd.Series([
+        "WATER TANK 1", "TANKS EAST", "STANDPIPE A", "ELEVATED TANK",
+        "GROUND STORAGE 2", "GST NORTH", "EST SOUTH", "CST 3", "WATER TOWER",
+        "WELL 05 - OAKMONT", "DISTRIBUTION SYSTEM", "TANKER TRUCK",
+        "BEST WELL", "PROTEST SITE", None,
+    ])
+    pattern = (r"\b(?:TANK|TANKS|STANDPIPE|ELEVATED|GROUND STORAGE"
+               r"|GST|EST|CST|TOWER)\b")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")           # any warning fails the test
+        hits = names.str.contains(pattern, case=False, na=False)
+
+    assert hits.sum() == 9, hits.sum()
+    for near_miss in ("TANKER TRUCK", "BEST WELL", "PROTEST SITE",
+                      "WELL 05 - OAKMONT", "DISTRIBUTION SYSTEM"):
+        assert not hits[names.tolist().index(near_miss)], near_miss
+
+
 def test_no_criteria_raises_so_caller_falls_back():
     R._session = _stub([])
     try:

@@ -1186,10 +1186,12 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     if not wsf.empty:
         df = wsf.copy()
     
-        # normalize fields we rely on
+        # normalize fields we rely on. fillna first: a bare astype(str) turns
+        # a null into the literal string "nan", which then prints as a facility
+        # name and matches nothing sensibly.
         for c in ("FACILITY_TYPE_CODE","FACILITY_NAME","FACILITY_ACTIVITY_CODE","IS_SOURCE_IND"):
             if c in df.columns:
-                df[c] = df[c].astype(str)
+                df[c] = df[c].fillna("").astype(str)
     
         # exclude obvious sources
         if "IS_SOURCE_IND" in df.columns:
@@ -1206,7 +1208,13 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     
         # optional name-based fallback (kept conservative)
         if "FACILITY_NAME" in df.columns:
-            name_pattern = r"\b(TANK|TANKS|STANDPIPE|ELEVATED|GROUND STORAGE|GST|EST|CST|TOWER)\b"
+            # Non-capturing group: pandas warns on a capturing group in
+            # str.contains ("has match groups") because it is ambiguous with
+            # str.extract, and the behaviour of such patterns has changed
+            # across pandas versions. Match is identical, the group is just
+            # not captured.
+            name_pattern = (r"\b(?:TANK|TANKS|STANDPIPE|ELEVATED|GROUND STORAGE"
+                            r"|GST|EST|CST|TOWER)\b")
             name_hit = df["FACILITY_NAME"].str.contains(name_pattern, case=False, na=False)
         else:
             name_hit = pd.Series(False, index=df.index)
