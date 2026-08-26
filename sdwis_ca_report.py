@@ -2,6 +2,7 @@
 import sys
 import io
 import re
+import time
 import functools
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -285,7 +286,12 @@ class FetchStats:
     reason: str = ""
 
     def describe(self) -> str:
-        status = "complete" if self.complete else f"INCOMPLETE - {self.reason}"
+        if not self.complete:
+            status = f"INCOMPLETE - {self.reason}"
+        elif self.reason:
+            status = f"complete ({self.reason})"
+        else:
+            status = "complete"
         return f"{self.label}: {self.rows:,} rows in {self.pages} page(s), {status}"
 
 
@@ -461,11 +467,13 @@ def fetch_by_pwsid_bulk(table: str, pwsids: list[str], stats: list | None = None
     ids = ids[:MAX_ENRICH]
 
     frames: list[pd.DataFrame] = []
-    failures = 0
+    failed, absent = 0, 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for df in pool.map(lambda i: fetch_table_by_pwsid(table, i), ids):
-            if df is None or df.empty:
-                failures += 1
+            if fetch_error_of(df):
+                failed += 1
+            elif df is None or df.empty:
+                absent += 1        # the system genuinely has no row here
             else:
                 frames.append(df)
 
@@ -475,9 +483,13 @@ def fetch_by_pwsid_bulk(table: str, pwsids: list[str], stats: list | None = None
         if capped:
             stat.complete = False
             stat.reason = f"only the first {MAX_ENRICH} of {len(pwsids):,} systems were looked up"
-        elif failures:
+        elif failed:
             stat.complete = False
-            stat.reason = f"{failures} of {len(ids)} lookups returned nothing"
+            stat.reason = (f"{failed} of {len(ids)} lookups FAILED after "
+                           f"{FETCH_RETRIES} attempts")
+        elif absent:
+            # Not an error: SDWIS simply has no row for these systems.
+            stat.reason = f"{absent} of {len(ids)} systems have no {table} record in SDWIS"
         stats.append(stat)
 
     if not frames:
@@ -569,7 +581,12 @@ def enrich_with_geography(candidates: pd.DataFrame, place: str,
     county = county.fillna("").astype(str).str.upper()
 
     if needle:
-        out["MATCHED_ON"] = "mailing address only"
+        # Neutral wording on purpose. SDWIS populates CITY_SERVED sparsely, so
+        # the absence of a served-city match is NOT evidence that a system does
+        # not serve the place -- only that SDWIS does not record it. The county
+        # column is the useful discriminator: a Roseville address on a system
+        # whose county is Siskiyou is clearly an operator's mailing address.
+        out["MATCHED_ON"] = "system address"
         out.loc[county.str.contains(needle, na=False), "MATCHED_ON"] = "county"
         out.loc[city.str.contains(needle, na=False), "MATCHED_ON"] = "served city"
     else:
@@ -652,7 +669,7 @@ def search_systems_targeted(state: str, name_query: str | None,
 
     if name and place:
         needle = place.upper()
-        enriched = enriched[enriched["MATCHED_ON"].isin(["served city", "county"])]
+        enriched = enriched[enriched["MATCHED_ON"] != "system address"]
         if enriched.empty:
             stats.append(FetchStats(
                 label=f"place filter {needle}", rows=0, pages=0, complete=True,
@@ -796,25 +813,60 @@ def search_by_name(state_code: str, name_query: str, county_filter: str | None) 
 
 # ----------------------- Fetch tables & report -----------------------
 
-def fetch_table_by_pwsid(table: str, pwsid: str) -> pd.DataFrame:
+FETCH_RETRIES = 3
+
+
+def fetch_table_by_pwsid(table: str, pwsid: str,
+                         retries: int = FETCH_RETRIES) -> pd.DataFrame:
+    """Fetch one table for one system.
+
+    Retries transient failures, and records the outcome on the frame as
+    .attrs["fetch_error"]. That distinction matters: previously any exception
+    produced an empty DataFrame, so "this system has no violations" and "the
+    request failed" were indistinguishable, and both rendered in the Word
+    report as "No data available." -- a fetch failure silently became a
+    factual-looking statement about the water system.
+    """
     url = PWSID_URL.format(table=table, pwsid=pwsid)
+    last_error = None
+    for attempt in range(max(1, retries)):
+        try:
+            data = api_get_json(url)
+            df = pd.DataFrame(data) if isinstance(data, list) and data else pd.DataFrame()
+            out = df_upper(df)
+            out.attrs["fetch_error"] = None
+            return out
+        except Exception as e:  # noqa: BLE001 - retry any transport failure
+            last_error = e
+            if attempt + 1 < max(1, retries):
+                time.sleep(0.5 * (2 ** attempt))
+
+    print(f"[Fetch {table} {pwsid}] failed after {retries} attempts: {last_error}")
+    out = pd.DataFrame()
+    out.attrs["fetch_error"] = f"{type(last_error).__name__}: {last_error}"
+    return out
+
+
+def fetch_error_of(df: pd.DataFrame | None) -> str | None:
+    """The recorded fetch failure for a frame, if any."""
+    if df is None:
+        return "no result"
     try:
-        data = api_get_json(url)
-        df = pd.DataFrame(data) if isinstance(data, list) and data else pd.DataFrame()
-        return df_upper(df)
-    except Exception as e:
-        print(f"[Fetch {table}] {e}")
-        return pd.DataFrame()
+        return df.attrs.get("fetch_error")
+    except AttributeError:
+        return None
 
 def fetch_all_selected(pwsid: str) -> dict[str, pd.DataFrame]:
     out = {}
     for table, wanted in TABLE_FIELDS.items():
         print(f"Fetching: {table}")
         df = fetch_table_by_pwsid(table, pwsid)
+        error = fetch_error_of(df)
         if not df.empty:
             keep = [c for c in wanted if c in df.columns]
             if keep:
                 df = df[keep]
+        df.attrs["fetch_error"] = error   # survives the column subset above
         out[table] = df
     return out
 
@@ -834,7 +886,10 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
 
     # ---------------- helpers ----------------
     def u(df: pd.DataFrame) -> pd.DataFrame:
-        return df_upper(df)
+        error = fetch_error_of(df)
+        out = df_upper(df)
+        out.attrs["fetch_error"] = error
+        return out
 
     def get1(df: pd.DataFrame, col: str, default: str = "N/A") -> str:
         if df.empty or col not in df.columns:
@@ -857,6 +912,21 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     def active_from(code: str | None) -> str:
         s = ("" if code is None else str(code).strip().upper())
         return {"A": "Yes", "I": "No"}.get(s, s or "N/A")
+
+    def no_data(*frames) -> str:
+        """What to print when a section has no rows.
+
+        If the underlying fetch failed, say so. Printing "No data available."
+        for a failed request states something false about the water system --
+        a reader cannot tell a clean system from a dropped connection.
+        """
+        for f in frames:
+            err = fetch_error_of(f)
+            if err:
+                return ("Not retrieved - the request to SDWIS failed "
+                        f"({err}). This is a data-retrieval problem, not a "
+                        "statement that the system has no records.")
+        return "No data available."
 
     def add_table(doc, headers: list[str], rows: list[list[str]]):
         t = doc.add_table(rows=1, cols=len(headers))
@@ -939,7 +1009,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
                   headers=["Type", "Active?", "Name", "SDWIS Facility ID", "State Facility ID", "Water Type", "Availability"],
                   rows=src_rows)
     else:
-        doc.add_paragraph("No data available.")
+        doc.add_paragraph(no_data(wsf))
 
     # -------- Treatment: only FACILITY_TYPE_CODE == 'TP'; sort by facility_name
     doc.add_paragraph("")  # spacer
@@ -974,7 +1044,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
                   headers=["Name", "Active?", "SDWIS Facility ID", "State Facility ID", "Treatment Objective", "Treatment Process"],
                   rows=tr_rows)
     else:
-        doc.add_paragraph("No data available.")
+        doc.add_paragraph(no_data(trt, wsf))
 
 # -------- Storage (codes + name fallback; exclude sources; sort by facility_name)
     stor_rows = []
@@ -1052,7 +1122,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     if hb_rows:
         add_table(doc, headers=["Category", "Type", "Contaminant"], rows=hb_rows)
     else:
-        doc.add_paragraph("No data available.")
+        doc.add_paragraph(no_data(vio))
 
     # Non-Health Based: only N; sort by category then code
     doc.add_paragraph("")  # spacer
@@ -1067,7 +1137,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     if nh_rows:
         add_table(doc, headers=["Category", "Type", "Contaminant"], rows=nh_rows)
     else:
-        doc.add_paragraph("No data available.")
+        doc.add_paragraph(no_data(vio))
 
     # ---------------- save ----------------
     if out_path is None:

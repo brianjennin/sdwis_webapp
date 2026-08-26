@@ -179,6 +179,81 @@ def test_out_of_state_rows_are_dropped():
     assert any("outside CA" in s.reason for s in stats), [s.describe() for s in stats]
 
 
+def test_failed_lookup_is_distinguished_from_absent_record():
+    """The "often blank" bug: a failed request became "No data available.".
+
+    A fetch failure must be recorded as an error, not silently returned as an
+    empty frame that reads as a factual statement about the water system.
+    """
+    def always_fails(url):
+        raise RuntimeError("connection reset")
+
+    original, R.api_get_json = R.api_get_json, always_fails
+    try:
+        df = R.fetch_table_by_pwsid("VIOLATION", "CA3110008", retries=1)
+    finally:
+        R.api_get_json = original
+    assert df.empty
+    assert R.fetch_error_of(df), "a failed fetch must record an error"
+
+    original, R.api_get_json = R.api_get_json, lambda url: []
+    try:
+        df2 = R.fetch_table_by_pwsid("VIOLATION", "CA3110008", retries=1)
+    finally:
+        R.api_get_json = original
+    assert df2.empty
+    assert not R.fetch_error_of(df2), "a genuinely empty table is not an error"
+
+
+def test_fetch_is_retried_before_giving_up():
+    calls = {"n": 0}
+
+    def flaky(url):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("transient")
+        return [{"PWSID": "CA3110008", "COUNTY_SERVED": "PLACER"}]
+
+    original, R.api_get_json = R.api_get_json, flaky
+    try:
+        df = R.fetch_table_by_pwsid("GEOGRAPHIC_AREA", "CA3110008", retries=3)
+    finally:
+        R.api_get_json = original
+    assert not df.empty, "a transient failure should be retried, not surfaced as blank"
+    assert not R.fetch_error_of(df)
+
+
+def test_place_search_lists_every_match_including_address_only():
+    """The user-facing requirement: show all systems, label them, do not drop
+    the address-only ones."""
+    ws = ("PWSID,PWS_NAME,CITY_NAME,STATE_CODE\n"
+          "CA3110008,CITY OF ROSEVILLE,ROSEVILLE,CA\n"
+          "CA4700884,SHASTINA MOBILE ESTATES,ROSEVILLE,CA\n")
+
+    def get(url, timeout=None, **kwargs):
+        if "/PWSID/" in url:
+            pwsid = url.split("/PWSID/")[1].split("/")[0]
+            if pwsid == "CA3110008":
+                return _Resp("", payload=[{"PWSID": pwsid, "CITY_SERVED": "ROSEVILLE",
+                                           "COUNTY_SERVED": "PLACER"}])
+            return _Resp("", payload=[{"PWSID": pwsid, "CITY_SERVED": "WEED",
+                                       "COUNTY_SERVED": "SISKIYOU"}])
+        if not url.endswith("/CSV") or "Rows/0:" not in url:
+            return _Resp("")
+        if "GEOGRAPHIC_AREA" in url:
+            return _Resp("PWSID,CITY_SERVED,COUNTY_SERVED\n")
+        return _Resp(ws)
+
+    R._session = types.SimpleNamespace(get=get)
+    out, stats = R.search_systems_targeted("CA", None, "roseville")
+    assert len(out) == 2, out.to_dict("records")
+    labels = dict(zip(out["PWSID"], out["MATCHED_ON"]))
+    assert labels["CA3110008"] == "served city", labels
+    assert labels["CA4700884"] == "system address", labels
+    assert dict(zip(out["PWSID"], out["COUNTY_SERVED"]))["CA4700884"] == "SISKIYOU"
+    assert all(s.complete for s in stats), [s.describe() for s in stats]
+
+
 def test_no_criteria_raises_so_caller_falls_back():
     R._session = _stub([])
     try:
