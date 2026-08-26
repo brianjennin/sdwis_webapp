@@ -84,16 +84,19 @@ def _filters_in(url: str) -> int:
 
 
 def test_url_shape():
-    path = R._ef_path("WATER_SYSTEM", "PWS_NAME", "PORTERVILLE", "CONTAINING")
-    assert path == "WATER_SYSTEM/PWS_NAME/CONTAINING/PORTERVILLE", path
+    path = R._ef_path("WATER_SYSTEM", [("PRIMACY_AGENCY_CODE", "CA"),
+                                       ("PWS_NAME", "CONTAINING", "PORTERVILLE")])
+    assert path == ("WATER_SYSTEM/PRIMACY_AGENCY_CODE/CA/"
+                    "PWS_NAME/CONTAINING/PORTERVILLE"), path
 
 
-def test_never_chains_two_filters():
-    """Envirofacts ignores all but one filter in a chain, so never send two.
+def test_state_is_chained_as_primacy_agency_not_state_code():
+    """STATE_CODE is the operator's MAILING address state, not the regulator.
 
-    Chaining STATE_CODE/CA with CITY_NAME/CONTAINING/ROSEVILLE returned Arizona
-    and Idaho systems from the live service. The state is applied client-side
-    instead; this pins that no request regains a second filter.
+    Filtering a California search on STATE_CODE returns Arizona- and
+    Idaho-regulated systems whose operator happens to post mail from
+    California. PRIMACY_AGENCY_CODE is the regulator and matches the PWSID
+    prefix, so that is what gets chained.
     """
     calls = []
     R._session = _stub(calls)
@@ -101,10 +104,8 @@ def test_never_chains_two_filters():
     searches = _search_calls(calls)
     assert searches, calls
     for c in searches:
-        path = c.split("/efservice/")[1].split("/Rows/")[0]
-        segments = [s for s in path.split("/") if s]
-        # table + column [+ operator] + value  ->  at most 4 segments
-        assert len(segments) <= 4, f"chained filter leaked back in: {path}"
+        assert "PRIMACY_AGENCY_CODE/CA" in c, f"state not chained correctly: {c}"
+        assert "/STATE_CODE/" not in c, f"STATE_CODE is the mailing state: {c}"
 
 
 def _search_calls(calls):
@@ -156,14 +157,13 @@ def test_place_search_uses_both_candidate_sources():
     calls = []
     R._session = _stub(calls)
     R.search_systems_targeted("CA", None, "porterville")
-    assert any("GEOGRAPHIC_AREA/CITY_SERVED/CONTAINING" in c for c in calls), calls
-    assert any("GEOGRAPHIC_AREA/COUNTY_SERVED/CONTAINING" in c for c in calls), calls
-    assert any("WATER_SYSTEM/CITY_NAME/CONTAINING" in c for c in calls), calls
+    assert any("GEOGRAPHIC_AREA" in c and "CITY_SERVED/CONTAINING" in c for c in calls), calls
+    assert any("GEOGRAPHIC_AREA" in c and "COUNTY_SERVED/CONTAINING" in c for c in calls), calls
+    assert any("WATER_SYSTEM" in c and "CITY_NAME/CONTAINING" in c for c in calls), calls
 
 
 def test_out_of_state_rows_are_dropped():
-    """Envirofacts has no state filter applied at all now (single filter only),
-    so the state MUST be enforced client-side or AZ/ID systems leak in."""
+    """Backstop: rows whose PWSID prefix is not the requested state are cut."""
     leaky = (
         "PWSID,PWS_NAME,CITY_NAME,STATE_CODE\n"
         "CA3110008,CITY OF ROSEVILLE,ROSEVILLE,CA\n"
@@ -333,6 +333,76 @@ def test_real_facility_codes_all_resolve():
             assert code in R.CODE_DESCRIPTIONS[key], f"{key} has no entry for {code!r}"
 
 
+def test_real_chained_filter_actually_works():
+    """Captured from data.epa.gov: chaining STATE_CODE onto CITY_NAME narrows
+    66 nationwide matches to 23. The filter is applied -- an earlier reading of
+    this module claimed chained filters were ignored, and that was wrong."""
+    wide = _load_fixture("roseville_water_system_city_name.json")
+    chained = _load_fixture("roseville_water_system_state_chained.json")
+    assert len(wide) == 66, len(wide)
+    assert len(chained) == 23, len(chained)
+    assert {r["pwsid"] for r in chained} <= {r["pwsid"] for r in wide}
+    # every chained row really is STATE_CODE = CA; the filter worked
+    assert {r["state_code"] for r in chained} == {"CA"}
+
+
+def test_real_state_code_is_the_mailing_state():
+    """Why Arizona and Idaho systems appeared in a California search."""
+    chained = _load_fixture("roseville_water_system_state_chained.json")
+    offenders = [r for r in chained if not r["pwsid"].startswith("CA")]
+    assert len(offenders) == 3, offenders
+    for r in offenders:
+        assert r["state_code"] == "CA"            # mailing address
+        assert r["primacy_agency_code"] != "CA"   # regulator
+        assert r["primacy_agency_code"] == r["pwsid"][:2]
+
+
+def test_real_primacy_agency_matches_pwsid_prefix():
+    """PRIMACY_AGENCY_CODE is the trustworthy state column: 0 disagreements."""
+    wide = _load_fixture("roseville_water_system_city_name.json")
+    assert all(r["primacy_agency_code"] == r["pwsid"][:2] for r in wide)
+
+
+def test_real_city_served_is_sparse():
+    """Only 7 GEOGRAPHIC_AREA rows nationwide have CITY_SERVED containing
+    ROSEVILLE, 2 of them Californian -- so an absent served-city match is not
+    evidence a system does not serve the place."""
+    ga = _load_fixture("roseville_geographic_area_city_served.json")
+    assert len(ga) == 7, len(ga)
+    assert len([r for r in ga if r["pwsid"].startswith("CA")]) == 2
+
+
+def test_real_treatment_table_loses_nothing():
+    """The report showed 19 treatment rows where TREATMENT holds 13.
+
+    The extra 6 are treatment-plant facilities with no TREATMENT record, not
+    duplicates, and no TREATMENT row is dropped by the join.
+    """
+    import pandas as pd
+    wsf = pd.DataFrame(_load_fixture("CA3110008_water_system_facility.json"))
+    trt = pd.DataFrame(_load_fixture("CA3110008_treatment.json"))
+    wsf.columns = [c.upper() for c in wsf.columns]
+    trt.columns = [c.upper() for c in trt.columns]
+
+    tp = wsf[wsf.FACILITY_TYPE_CODE.str.upper() == "TP"]
+    assert len(tp) == 14 and len(trt) == 13
+
+    t_min = trt[["FACILITY_ID", "TREATMENT_OBJECTIVE_CODE",
+                 "TREATMENT_PROCESS_CODE"]].drop_duplicates()
+    merged = tp.merge(t_min, on="FACILITY_ID", how="left")
+    assert len(merged) == 19, len(merged)
+    # nothing in TREATMENT points at a non-TP facility, so nothing is lost
+    assert set(trt.FACILITY_ID) <= set(tp.FACILITY_ID)
+
+
+def test_real_violation_count():
+    """One violation on record; the report showed one."""
+    vio = _load_fixture("CA3110008_violation.json")
+    assert len(vio) == 1, len(vio)
+    assert vio[0]["violation_category_code"] == "MR"
+    assert vio[0]["is_health_based_ind"] == "N"
+
+
 def test_no_criteria_raises_so_caller_falls_back():
     R._session = _stub([])
     try:
@@ -363,7 +433,7 @@ def test_targeted_page_failure_raises():
 
     R._session = types.SimpleNamespace(get=get)
     try:
-        R.ef_query("WATER_SYSTEM", "STATE_CODE", "CA", page_size=2)
+        R.ef_query("WATER_SYSTEM", [("PRIMACY_AGENCY_CODE", "CA")], page_size=2)
     except Exception:
         return
     raise AssertionError("a failed page must raise, never return partial rows")

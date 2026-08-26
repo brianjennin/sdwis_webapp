@@ -245,10 +245,10 @@ else:
         with st.expander("How this result was fetched", expanded=bool(incomplete)):
             st.write(f"Path: **{how}**")
             st.caption(
-                "Each request below carries exactly one filter, because "
-                "Envirofacts ignores all but one filter in a chain. The state "
-                "is applied here rather than by the service, and county comes "
-                "from a per-system lookup."
+                "The state is chained onto each search as PRIMACY_AGENCY_CODE "
+                "(the regulating agency). Filtering on STATE_CODE instead would "
+                "return systems regulated by other states whose operator posts "
+                "mail from here. County comes from a per-system lookup."
             )
             if stats:
                 for s in stats:

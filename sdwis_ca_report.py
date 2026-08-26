@@ -439,20 +439,28 @@ SEARCH_PAGE_SIZE = 5000
 SEARCH_MAX_PAGES = 4
 
 
-def _ef_path(table: str, column: str, value: str, operator: str = "") -> str:
-    """Build an Envirofacts path for exactly ONE filter.
+def _ef_path(table: str, filters: list[tuple]) -> str:
+    """Build an Envirofacts path from one or more chained column filters.
 
-    Envirofacts does NOT AND chained filters. Proven twice against the live
-    service: a CA search chaining STATE_CODE/CA with CITY_NAME/CONTAINING/
-    ROSEVILLE returned Arizona and Idaho systems (only the CONTAINING filter
-    applied), while the single-filter per-PWSID URL the Word report uses
-    returns correct data every time. So this deliberately accepts one column
-    only -- narrowing further is done client-side, where it is predictable.
+    Each filter is (column, value) or (column, operator, value), e.g.
+        /WATER_SYSTEM/PRIMACY_AGENCY_CODE/CA/CITY_NAME/CONTAINING/ROSEVILLE
+
+    Chained filters DO combine with AND. An earlier version of this module
+    concluded otherwise, because a CA search returned systems with Arizona and
+    Idaho PWSIDs. That was a misreading: every one of those rows really does
+    have STATE_CODE = 'CA', because STATE_CODE is the operator's MAILING
+    ADDRESS state. The regulator is PRIMACY_AGENCY_CODE, which matched the
+    PWSID prefix on all 66 rows of the verification pull. Chain on
+    PRIMACY_AGENCY_CODE when you mean "systems in this state".
     """
-    parts = [table, column]
-    if operator:
-        parts.append(operator)
-    parts.append(quote(str(value), safe=""))
+    parts = [table]
+    for f in filters:
+        if len(f) == 2:
+            col, val = f
+            parts += [col, quote(str(val), safe="")]
+        else:
+            col, op, val = f
+            parts += [col, op, quote(str(val), safe="")]
     return "/".join(parts)
 
 
@@ -479,16 +487,16 @@ def _ef_page(url_without_format: str) -> pd.DataFrame:
     raise RuntimeError(f"Envirofacts query failed: {url_without_format} ({last_error})")
 
 
-def ef_query(table: str, column: str, value: str, operator: str = "",
+def ef_query(table: str, filters: list[tuple],
              page_size: int = SEARCH_PAGE_SIZE,
              max_pages: int = SEARCH_MAX_PAGES,
              stats: list | None = None) -> pd.DataFrame:
-    """Run a single-filter Envirofacts query. Raises so callers can fall back.
+    """Run a filtered Envirofacts query. Raises so callers can fall back.
 
     Stops as soon as a short page comes back instead of always spending one
     extra round trip discovering an empty page.
     """
-    path = _ef_path(table, column, value, operator)
+    path = _ef_path(table, filters)
     stat = FetchStats(label=path)
     frames = []
     hit_cap = True
@@ -570,16 +578,14 @@ def _empty_result() -> pd.DataFrame:
 
 def enforce_state(df: pd.DataFrame, sc: str, stats: list | None = None,
                   label: str = "") -> pd.DataFrame:
-    """Drop rows that are not in the requested state.
+    """Keep only systems regulated by the requested state.
 
-    Envirofacts does NOT reliably honour a chained STATE_CODE filter when the
-    chain also uses an operator such as CONTAINING: a CA search for city
-    "ROSEVILLE" came back with Arizona and Idaho systems. PWSIDs are prefixed
-    with their state, so the state is re-checked here and the server filter is
-    treated as a hint, never a guarantee.
-
-    A non-zero drop count is recorded in stats -- it is direct evidence that
-    the server-side filter was ignored.
+    Queries chain on PRIMACY_AGENCY_CODE, which is the regulating agency and
+    matches the PWSID prefix. This stays as a cheap backstop, and it also
+    catches the case that caused real confusion: filtering on STATE_CODE
+    instead returns systems whose OPERATOR'S MAILING ADDRESS is in the state
+    while the system itself sits elsewhere (a CA "Roseville" search pulled in
+    Arizona- and Idaho-regulated systems that way).
     """
     if df.empty or "PWSID" not in df.columns:
         return df
@@ -664,9 +670,11 @@ def search_systems_targeted(state: str, name_query: str | None,
 
     Returns (results, stats) so the caller can show what was actually fetched.
 
-    Every Envirofacts request here carries exactly ONE filter, because the
-    service ignores all but one filter in a chain. The state is therefore
-    applied client-side, and county comes from per-PWSID lookups.
+    Requests chain the state onto the search filter -- verified to work, and
+    it cuts a nationwide "ROSEVILLE" city match from 66 rows to 23. The state
+    is chained as PRIMACY_AGENCY_CODE (the regulator), NOT STATE_CODE, which
+    is the operator's mailing-address state and pulls in systems regulated by
+    other states. County comes from per-PWSID lookups.
 
     For a place, two independent candidate sources are unioned so the result
     does not depend on a system's mailing address:
@@ -691,7 +699,10 @@ def search_systems_targeted(state: str, name_query: str | None,
             raise ValueError("no usable name tokens")
         lead = max(tokens, key=len)
 
-        ws = ef_query("WATER_SYSTEM", "PWS_NAME", lead.upper(), "CONTAINING", stats=stats)
+        ws = ef_query("WATER_SYSTEM", [
+            ("PRIMACY_AGENCY_CODE", sc),
+            ("PWS_NAME", "CONTAINING", lead.upper()),
+        ], stats=stats)
         ws = enforce_state(ws, sc, stats, "WATER_SYSTEM name")
         if not ws.empty and "PWS_NAME" in ws.columns:
             remaining = [t for t in tokens if t != lead]
@@ -702,13 +713,19 @@ def search_systems_targeted(state: str, name_query: str | None,
         # Systems that SERVE the place, by served city and by county.
         area_ids: list[str] = []
         for column in ("CITY_SERVED", "COUNTY_SERVED"):
-            ga = ef_query("GEOGRAPHIC_AREA", column, place.upper(), "CONTAINING", stats=stats)
+            ga = ef_query("GEOGRAPHIC_AREA", [
+                ("PRIMACY_AGENCY_CODE", sc),
+                (column, "CONTAINING", place.upper()),
+            ], stats=stats)
             ga = enforce_state(ga, sc, stats, f"GEOGRAPHIC_AREA {column}")
             if not ga.empty and "PWSID" in ga.columns:
                 area_ids.extend(ga["PWSID"].dropna().astype(str).tolist())
 
         # Systems whose own city matches (mailing address; kept, then labelled).
-        by_city = ef_query("WATER_SYSTEM", "CITY_NAME", place.upper(), "CONTAINING", stats=stats)
+        by_city = ef_query("WATER_SYSTEM", [
+            ("PRIMACY_AGENCY_CODE", sc),
+            ("CITY_NAME", "CONTAINING", place.upper()),
+        ], stats=stats)
         by_city = enforce_state(by_city, sc, stats, "WATER_SYSTEM city")
 
         known = set(by_city["PWSID"].astype(str)) if "PWSID" in by_city.columns else set()
