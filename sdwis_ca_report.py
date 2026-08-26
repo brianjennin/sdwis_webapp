@@ -1,6 +1,8 @@
 # sdwis_ca_report.py — imports
 import sys
 import io
+import os
+import csv
 import re
 import time
 import functools
@@ -235,6 +237,68 @@ CODE_DESCRIPTIONS["TREATMENT_PROCESS_CODE"] = {
     **TREATMENT_PROCESS_MAP,
 }
 
+# ---------------- Reference code values ----------------
+#
+# SDWA_REF_CODE_VALUES.csv is EPA's own list of code meanings and ships with
+# this repo. The hardcoded CODE_DESCRIPTIONS above were incomplete -- 21 codes
+# across 5 types had no entry, and desc() falls back to printing the raw code,
+# so reports showed "Activity Status: N" instead of "Changed from public to
+# non-public", and half of all FACILITY_TYPE_CODE values rendered as two-letter
+# codes. The reference file fills those gaps; hand-written wording still wins
+# where it exists.
+
+REF_CODE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "SDWA_REF_CODE_VALUES.csv")
+
+# App column name -> VALUE_TYPE in the reference file, where they differ.
+REF_TYPE_ALIASES = {
+    "PWS_ACTIVITY_CODE": "ACTIVITY_CODE",
+    "FACILITY_ACTIVITY_CODE": "ACTIVITY_CODE",
+}
+
+
+def load_reference_codes(path: str = REF_CODE_PATH) -> dict[str, dict[str, str]]:
+    """VALUE_TYPE -> {VALUE_CODE: VALUE_DESCRIPTION} from EPA's reference file."""
+    out: dict[str, dict[str, str]] = {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                vtype = (row.get("VALUE_TYPE") or "").strip()
+                code = (row.get("VALUE_CODE") or "").strip()
+                desc_text = (row.get("VALUE_DESCRIPTION") or "").strip()
+                if vtype and code:
+                    out.setdefault(vtype, {})[code] = desc_text
+    except Exception as e:  # noqa: BLE001 - reference file is optional
+        print(f"[codes] could not read {path}: {e}")
+    return out
+
+
+def _merge_reference_codes() -> int:
+    """Fill gaps in CODE_DESCRIPTIONS from the reference file. Returns count added."""
+    ref = load_reference_codes()
+    if not ref:
+        return 0
+    added = 0
+    # Seed aliased keys the app never hardcoded (e.g. FACILITY_ACTIVITY_CODE,
+    # which is rendered via active_from() but should still resolve by code).
+    for alias, vtype in REF_TYPE_ALIASES.items():
+        if alias not in CODE_DESCRIPTIONS and vtype in ref:
+            CODE_DESCRIPTIONS[alias] = {}
+    for key in list(CODE_DESCRIPTIONS):
+        vtype = REF_TYPE_ALIASES.get(key, key)
+        for code, text in ref.get(vtype, {}).items():
+            if code not in CODE_DESCRIPTIONS[key]:
+                CODE_DESCRIPTIONS[key][code] = text
+                added += 1
+    # Also expose reference-only types the app does not hardcode at all.
+    for vtype, mapping in ref.items():
+        CODE_DESCRIPTIONS.setdefault(vtype, dict(mapping))
+    return added
+
+
+CODES_ADDED_FROM_REFERENCE = _merge_reference_codes()
+
+
 # Paging for local pulls (bump if needed)
 PAGE_SIZE = 50000
 MAX_PAGES = 10   # up to ~500k rows per table
@@ -375,20 +439,28 @@ SEARCH_PAGE_SIZE = 5000
 SEARCH_MAX_PAGES = 4
 
 
-def _ef_path(table: str, column: str, value: str, operator: str = "") -> str:
-    """Build an Envirofacts path for exactly ONE filter.
+def _ef_path(table: str, filters: list[tuple]) -> str:
+    """Build an Envirofacts path from one or more chained column filters.
 
-    Envirofacts does NOT AND chained filters. Proven twice against the live
-    service: a CA search chaining STATE_CODE/CA with CITY_NAME/CONTAINING/
-    ROSEVILLE returned Arizona and Idaho systems (only the CONTAINING filter
-    applied), while the single-filter per-PWSID URL the Word report uses
-    returns correct data every time. So this deliberately accepts one column
-    only -- narrowing further is done client-side, where it is predictable.
+    Each filter is (column, value) or (column, operator, value), e.g.
+        /WATER_SYSTEM/PRIMACY_AGENCY_CODE/CA/CITY_NAME/CONTAINING/ROSEVILLE
+
+    Chained filters DO combine with AND. An earlier version of this module
+    concluded otherwise, because a CA search returned systems with Arizona and
+    Idaho PWSIDs. That was a misreading: every one of those rows really does
+    have STATE_CODE = 'CA', because STATE_CODE is the operator's MAILING
+    ADDRESS state. The regulator is PRIMACY_AGENCY_CODE, which matched the
+    PWSID prefix on all 66 rows of the verification pull. Chain on
+    PRIMACY_AGENCY_CODE when you mean "systems in this state".
     """
-    parts = [table, column]
-    if operator:
-        parts.append(operator)
-    parts.append(quote(str(value), safe=""))
+    parts = [table]
+    for f in filters:
+        if len(f) == 2:
+            col, val = f
+            parts += [col, quote(str(val), safe="")]
+        else:
+            col, op, val = f
+            parts += [col, op, quote(str(val), safe="")]
     return "/".join(parts)
 
 
@@ -415,16 +487,16 @@ def _ef_page(url_without_format: str) -> pd.DataFrame:
     raise RuntimeError(f"Envirofacts query failed: {url_without_format} ({last_error})")
 
 
-def ef_query(table: str, column: str, value: str, operator: str = "",
+def ef_query(table: str, filters: list[tuple],
              page_size: int = SEARCH_PAGE_SIZE,
              max_pages: int = SEARCH_MAX_PAGES,
              stats: list | None = None) -> pd.DataFrame:
-    """Run a single-filter Envirofacts query. Raises so callers can fall back.
+    """Run a filtered Envirofacts query. Raises so callers can fall back.
 
     Stops as soon as a short page comes back instead of always spending one
     extra round trip discovering an empty page.
     """
-    path = _ef_path(table, column, value, operator)
+    path = _ef_path(table, filters)
     stat = FetchStats(label=path)
     frames = []
     hit_cap = True
@@ -506,16 +578,14 @@ def _empty_result() -> pd.DataFrame:
 
 def enforce_state(df: pd.DataFrame, sc: str, stats: list | None = None,
                   label: str = "") -> pd.DataFrame:
-    """Drop rows that are not in the requested state.
+    """Keep only systems regulated by the requested state.
 
-    Envirofacts does NOT reliably honour a chained STATE_CODE filter when the
-    chain also uses an operator such as CONTAINING: a CA search for city
-    "ROSEVILLE" came back with Arizona and Idaho systems. PWSIDs are prefixed
-    with their state, so the state is re-checked here and the server filter is
-    treated as a hint, never a guarantee.
-
-    A non-zero drop count is recorded in stats -- it is direct evidence that
-    the server-side filter was ignored.
+    Queries chain on PRIMACY_AGENCY_CODE, which is the regulating agency and
+    matches the PWSID prefix. This stays as a cheap backstop, and it also
+    catches the case that caused real confusion: filtering on STATE_CODE
+    instead returns systems whose OPERATOR'S MAILING ADDRESS is in the state
+    while the system itself sits elsewhere (a CA "Roseville" search pulled in
+    Arizona- and Idaho-regulated systems that way).
     """
     if df.empty or "PWSID" not in df.columns:
         return df
@@ -600,9 +670,11 @@ def search_systems_targeted(state: str, name_query: str | None,
 
     Returns (results, stats) so the caller can show what was actually fetched.
 
-    Every Envirofacts request here carries exactly ONE filter, because the
-    service ignores all but one filter in a chain. The state is therefore
-    applied client-side, and county comes from per-PWSID lookups.
+    Requests chain the state onto the search filter -- verified to work, and
+    it cuts a nationwide "ROSEVILLE" city match from 66 rows to 23. The state
+    is chained as PRIMACY_AGENCY_CODE (the regulator), NOT STATE_CODE, which
+    is the operator's mailing-address state and pulls in systems regulated by
+    other states. County comes from per-PWSID lookups.
 
     For a place, two independent candidate sources are unioned so the result
     does not depend on a system's mailing address:
@@ -627,7 +699,10 @@ def search_systems_targeted(state: str, name_query: str | None,
             raise ValueError("no usable name tokens")
         lead = max(tokens, key=len)
 
-        ws = ef_query("WATER_SYSTEM", "PWS_NAME", lead.upper(), "CONTAINING", stats=stats)
+        ws = ef_query("WATER_SYSTEM", [
+            ("PRIMACY_AGENCY_CODE", sc),
+            ("PWS_NAME", "CONTAINING", lead.upper()),
+        ], stats=stats)
         ws = enforce_state(ws, sc, stats, "WATER_SYSTEM name")
         if not ws.empty and "PWS_NAME" in ws.columns:
             remaining = [t for t in tokens if t != lead]
@@ -638,13 +713,19 @@ def search_systems_targeted(state: str, name_query: str | None,
         # Systems that SERVE the place, by served city and by county.
         area_ids: list[str] = []
         for column in ("CITY_SERVED", "COUNTY_SERVED"):
-            ga = ef_query("GEOGRAPHIC_AREA", column, place.upper(), "CONTAINING", stats=stats)
+            ga = ef_query("GEOGRAPHIC_AREA", [
+                ("PRIMACY_AGENCY_CODE", sc),
+                (column, "CONTAINING", place.upper()),
+            ], stats=stats)
             ga = enforce_state(ga, sc, stats, f"GEOGRAPHIC_AREA {column}")
             if not ga.empty and "PWSID" in ga.columns:
                 area_ids.extend(ga["PWSID"].dropna().astype(str).tolist())
 
         # Systems whose own city matches (mailing address; kept, then labelled).
-        by_city = ef_query("WATER_SYSTEM", "CITY_NAME", place.upper(), "CONTAINING", stats=stats)
+        by_city = ef_query("WATER_SYSTEM", [
+            ("PRIMACY_AGENCY_CODE", sc),
+            ("CITY_NAME", "CONTAINING", place.upper()),
+        ], stats=stats)
         by_city = enforce_state(by_city, sc, stats, "WATER_SYSTEM city")
 
         known = set(by_city["PWSID"].astype(str)) if "PWSID" in by_city.columns else set()
@@ -814,6 +895,8 @@ def search_by_name(state_code: str, name_query: str, county_filter: str | None) 
 # ----------------------- Fetch tables & report -----------------------
 
 FETCH_RETRIES = 3
+PWSID_PAGE_SIZE = 1000
+PWSID_MAX_PAGES = 20
 
 
 def fetch_table_by_pwsid(table: str, pwsid: str,
@@ -827,14 +910,33 @@ def fetch_table_by_pwsid(table: str, pwsid: str,
     report as "No data available." -- a fetch failure silently became a
     factual-looking statement about the water system.
     """
-    url = PWSID_URL.format(table=table, pwsid=pwsid)
     last_error = None
     for attempt in range(max(1, retries)):
         try:
-            data = api_get_json(url)
-            df = pd.DataFrame(data) if isinstance(data, list) and data else pd.DataFrame()
+            # Paged explicitly. The bare /PWSID/<id>/JSON URL returns whatever
+            # the service's default row limit allows, with no way to tell a
+            # complete answer from a truncated one -- so ask for windows and
+            # stop only when a short page proves the end was reached.
+            parts, truncated = [], False
+            for page in range(PWSID_MAX_PAGES):
+                lo = page * PWSID_PAGE_SIZE
+                hi = lo + PWSID_PAGE_SIZE - 1
+                url = f"{BASE}/{table}/PWSID/{pwsid}/Rows/{lo}:{hi}/JSON"
+                data = api_get_json(url)
+                if not isinstance(data, list) or not data:
+                    break
+                parts.append(pd.DataFrame(data))
+                if len(data) < PWSID_PAGE_SIZE:
+                    break
+            else:
+                truncated = True
+
+            df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
             out = df_upper(df)
-            out.attrs["fetch_error"] = None
+            out.attrs["fetch_error"] = (
+                f"stopped at the {PWSID_MAX_PAGES}-page cap; more rows exist"
+                if truncated else None
+            )
             return out
         except Exception as e:  # noqa: BLE001 - retry any transport failure
             last_error = e
@@ -907,7 +1009,11 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
 
     def yn_from(code: str | None) -> str:
         s = ("" if code is None else str(code).strip().upper())
-        return {"Y": "Yes", "N": "No"}.get(s, s or "N/A")
+        # A null that has been through astype(str) arrives as "NAN"/"NONE";
+        # without this the report prints NAN where SDWIS simply has no value.
+        if s in ("", "NAN", "NONE", "NAT", "<NA>"):
+            return "N/A"
+        return {"Y": "Yes", "N": "No"}.get(s, s)
 
     def active_from(code: str | None) -> str:
         s = ("" if code is None else str(code).strip().upper())
@@ -947,6 +1053,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     wsf = u(data.get("WATER_SYSTEM_FACILITY", pd.DataFrame()))
     vio = u(data.get("VIOLATION", pd.DataFrame()))
     trt = u(data.get("TREATMENT", pd.DataFrame()))  # optional; used to enrich treatment rows
+    srv = u(data.get("SERVICE_AREA", pd.DataFrame()))
 
     # ---------------- summary ----------------
     ws_name     = get1(ws, "PWS_NAME")
@@ -965,8 +1072,13 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     county = "N/A"
     if not ga.empty and "COUNTY_SERVED" in ga.columns:
         non_empty = ga["COUNTY_SERVED"].dropna().astype(str).str.strip()
+        non_empty = non_empty[non_empty != ""]
         if not non_empty.empty:
-            county = non_empty.iloc[0] or "N/A"
+            county = non_empty.iloc[0]
+    if county == "N/A" and fetch_error_of(ga):
+        # Distinguish "SDWIS has no county for this system" from "the request
+        # failed"; printing N/A for a failure invents a fact about the system.
+        county = "Not retrieved (SDWIS request failed)"
 
     doc = Document()
     doc.add_heading(f"Summary Information for Water Utility {pwsid}", level=0)
@@ -980,6 +1092,29 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
 
     # ======================== Facilities ========================
     doc.add_heading("Facilities", level=1)
+
+    # State the coverage. The Sources table lists only IS_SOURCE_IND = 'Y',
+    # so a system's treatment plants and distribution system never appear
+    # there. Verified against SDWIS for CA3110008: 34 facilities, 19 of them
+    # sources -- without this line the other 15 are silently absent and the
+    # reader cannot tell an omission from an empty record.
+    if not wsf.empty and "IS_SOURCE_IND" in wsf.columns:
+        total_fac = len(wsf)
+        n_src = int((wsf["IS_SOURCE_IND"].astype(str).str.upper() == "Y").sum())
+        other = total_fac - n_src
+        summary = f"SDWIS lists {total_fac} facilities for this system: {n_src} source"
+        summary += "" if n_src == 1 else "s"
+        if other:
+            kinds = []
+            if "FACILITY_TYPE_CODE" in wsf.columns:
+                non_src = wsf[wsf["IS_SOURCE_IND"].astype(str).str.upper() != "Y"]
+                for code, n in non_src["FACILITY_TYPE_CODE"].value_counts().items():
+                    kinds.append(f"{n} {desc('FACILITY_TYPE_CODE', code)}")
+            detail = f" ({', '.join(kinds)})" if kinds else ""
+            summary += (f", and {other} non-source facilit"
+                        f"{'y' if other == 1 else 'ies'}{detail} "
+                        "not listed under Sources below")
+        doc.add_paragraph(summary + ".")
 
     # -------- Sources: only IS_SOURCE_IND == 'Y'; sort by type, activity, name
     doc.add_paragraph("Sources")
@@ -1051,10 +1186,12 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     if not wsf.empty:
         df = wsf.copy()
     
-        # normalize fields we rely on
+        # normalize fields we rely on. fillna first: a bare astype(str) turns
+        # a null into the literal string "nan", which then prints as a facility
+        # name and matches nothing sensibly.
         for c in ("FACILITY_TYPE_CODE","FACILITY_NAME","FACILITY_ACTIVITY_CODE","IS_SOURCE_IND"):
             if c in df.columns:
-                df[c] = df[c].astype(str)
+                df[c] = df[c].fillna("").astype(str)
     
         # exclude obvious sources
         if "IS_SOURCE_IND" in df.columns:
@@ -1071,7 +1208,13 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     
         # optional name-based fallback (kept conservative)
         if "FACILITY_NAME" in df.columns:
-            name_pattern = r"\b(TANK|TANKS|STANDPIPE|ELEVATED|GROUND STORAGE|GST|EST|CST|TOWER)\b"
+            # Non-capturing group: pandas warns on a capturing group in
+            # str.contains ("has match groups") because it is ambiguous with
+            # str.extract, and the behaviour of such patterns has changed
+            # across pandas versions. Match is identical, the group is just
+            # not captured.
+            name_pattern = (r"\b(?:TANK|TANKS|STANDPIPE|ELEVATED|GROUND STORAGE"
+                            r"|GST|EST|CST|TOWER)\b")
             name_hit = df["FACILITY_NAME"].str.contains(name_pattern, case=False, na=False)
         else:
             name_hit = pd.Series(False, index=df.index)
@@ -1098,6 +1241,40 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     # else: omit Storage section
 
     # ======================== Violations ========================
+    # ======================== Service Area ========================
+    # SERVICE_AREA was already being fetched for every report and then never
+    # rendered. It answers "who does this system actually serve" -- CITY OF
+    # ROSEVILLE, for instance, is both a Residential Area (primary) and a
+    # Wholesaler of Water, which the rest of the report never showed.
+    doc.add_heading("Service Area", level=1)
+    sa_rows = []
+    if not srv.empty and "SERVICE_AREA_TYPE_CODE" in srv.columns:
+        sa_df = srv.copy()
+        for c in ("SERVICE_AREA_TYPE_CODE", "IS_PRIMARY_SERVICE_AREA_CODE"):
+            if c in sa_df.columns:
+                sa_df[c] = sa_df[c].fillna("").astype(str)
+        sa_df = sa_df.drop_duplicates(
+            subset=[c for c in ["SERVICE_AREA_TYPE_CODE"] if c in sa_df.columns]
+        )
+        # Primary areas first, then alphabetically by description.
+        sa_df["_primary"] = (
+            sa_df.get("IS_PRIMARY_SERVICE_AREA_CODE", "").astype(str).str.upper().eq("Y")
+        )
+        sa_df["_label"] = sa_df["SERVICE_AREA_TYPE_CODE"].map(
+            lambda c: desc("SERVICE_AREA_TYPE_CODE", c)
+        )
+        sa_df = sa_df.sort_values(["_primary", "_label"], ascending=[False, True],
+                                  kind="mergesort")
+        for _, r in sa_df.iterrows():
+            sa_rows.append([
+                r["_label"],
+                yn_from(r.get("IS_PRIMARY_SERVICE_AREA_CODE", "")),
+            ])
+    if sa_rows:
+        add_table(doc, headers=["Service Area Type", "Primary?"], rows=sa_rows)
+    else:
+        doc.add_paragraph(no_data(srv))
+
     doc.add_heading("Violations", level=1)
 
     def vio_rows_from(df: pd.DataFrame) -> list[list[str]]:

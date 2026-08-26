@@ -1,0 +1,20 @@
+[
+{
+  "pwsid": "CA3110008",
+  "primacy_agency_code": "CA",
+  "epa_region": "09",
+  "pws_activity_code": "A",
+  "pws_type_code": "CWS",
+  "service_area_type_code": "RA",
+  "is_primary_service_area_code": "Y"
+},
+{
+  "pwsid": "CA3110008",
+  "primacy_agency_code": "CA",
+  "epa_region": "09",
+  "pws_activity_code": "A",
+  "pws_type_code": "CWS",
+  "service_area_type_code": "WH",
+  "is_primary_service_area_code": null
+}
+]

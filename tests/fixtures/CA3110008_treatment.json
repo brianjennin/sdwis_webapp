@@ -1,0 +1,106 @@
+[
+{
+  "pwsid": "CA3110008",
+  "facility_id": "1223",
+  "treatment_id": "466",
+  "comments_text": "HYPOCHLORINATION, POST",
+  "treatment_objective_code": "D",
+  "treatment_process_code": "421"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "1235",
+  "treatment_id": "467",
+  "comments_text": "HYPOCHLORINATION, POST",
+  "treatment_objective_code": "D",
+  "treatment_process_code": "421"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "1237",
+  "treatment_id": "465",
+  "comments_text": "HYPOCHLORINATION, POST",
+  "treatment_objective_code": "D",
+  "treatment_process_code": "421"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "1238",
+  "treatment_id": "19427",
+  "comments_text": "FLUORIDATION",
+  "treatment_objective_code": "Z",
+  "treatment_process_code": "380"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "1238",
+  "treatment_id": "464",
+  "comments_text": "HYPOCHLORINATION, POST",
+  "treatment_objective_code": "D",
+  "treatment_process_code": "421"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "1239",
+  "treatment_id": "462",
+  "comments_text": "FLUORIDATION",
+  "treatment_objective_code": "Z",
+  "treatment_process_code": "380"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "1239",
+  "treatment_id": "463",
+  "comments_text": "FILTRATION, RAPID SAND",
+  "treatment_objective_code": "P",
+  "treatment_process_code": "345"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "57751",
+  "treatment_id": "19425",
+  "comments_text": "HYPOCHLORINATION, POST",
+  "treatment_objective_code": "D",
+  "treatment_process_code": "421"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "57751",
+  "treatment_id": "19429",
+  "comments_text": "FLUORIDATION",
+  "treatment_objective_code": "Z",
+  "treatment_process_code": "380"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "57753",
+  "treatment_id": "19426",
+  "comments_text": "HYPOCHLORINATION, POST",
+  "treatment_objective_code": "D",
+  "treatment_process_code": "421"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "57753",
+  "treatment_id": "19428",
+  "comments_text": "FLUORIDATION",
+  "treatment_objective_code": "Z",
+  "treatment_process_code": "380"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "66098",
+  "treatment_id": "18166",
+  "comments_text": "HYPOCHLORINATION, POST",
+  "treatment_objective_code": "D",
+  "treatment_process_code": "421"
+},
+{
+  "pwsid": "CA3110008",
+  "facility_id": "66098",
+  "treatment_id": "18167",
+  "comments_text": "FLUORIDATION",
+  "treatment_objective_code": "Z",
+  "treatment_process_code": "380"
+}
+]
