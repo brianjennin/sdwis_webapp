@@ -3,6 +3,7 @@ import sys
 import io
 import re
 import functools
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -368,16 +369,20 @@ SEARCH_PAGE_SIZE = 5000
 SEARCH_MAX_PAGES = 4
 
 
-def _ef_path(table: str, filters: list[tuple]) -> str:
-    """Build an Envirofacts path: (col, val) or (col, operator, val) pairs."""
-    parts = [table]
-    for f in filters:
-        if len(f) == 2:
-            col, val = f
-            parts += [col, quote(str(val), safe="")]
-        else:
-            col, op, val = f
-            parts += [col, op, quote(str(val), safe="")]
+def _ef_path(table: str, column: str, value: str, operator: str = "") -> str:
+    """Build an Envirofacts path for exactly ONE filter.
+
+    Envirofacts does NOT AND chained filters. Proven twice against the live
+    service: a CA search chaining STATE_CODE/CA with CITY_NAME/CONTAINING/
+    ROSEVILLE returned Arizona and Idaho systems (only the CONTAINING filter
+    applied), while the single-filter per-PWSID URL the Word report uses
+    returns correct data every time. So this deliberately accepts one column
+    only -- narrowing further is done client-side, where it is predictable.
+    """
+    parts = [table, column]
+    if operator:
+        parts.append(operator)
+    parts.append(quote(str(value), safe=""))
     return "/".join(parts)
 
 
@@ -404,16 +409,16 @@ def _ef_page(url_without_format: str) -> pd.DataFrame:
     raise RuntimeError(f"Envirofacts query failed: {url_without_format} ({last_error})")
 
 
-def ef_query(table: str, filters: list[tuple],
+def ef_query(table: str, column: str, value: str, operator: str = "",
              page_size: int = SEARCH_PAGE_SIZE,
              max_pages: int = SEARCH_MAX_PAGES,
              stats: list | None = None) -> pd.DataFrame:
-    """Run a filtered Envirofacts query. Raises so callers can fall back.
+    """Run a single-filter Envirofacts query. Raises so callers can fall back.
 
-    Unlike pull_rows_filtered, this stops as soon as a short page comes back
-    instead of always spending one extra round trip discovering an empty page.
+    Stops as soon as a short page comes back instead of always spending one
+    extra round trip discovering an empty page.
     """
-    path = _ef_path(table, filters)
+    path = _ef_path(table, column, value, operator)
     stat = FetchStats(label=path)
     frames = []
     hit_cap = True
@@ -440,27 +445,41 @@ def ef_query(table: str, filters: list[tuple],
     return df_upper(pd.concat(frames, ignore_index=True))
 
 
-def ef_systems_by_pwsid(pwsids: list[str], chunk: int = 40, max_chunks: int = 25,
-                        stats: list | None = None) -> pd.DataFrame:
-    """Fetch WATER_SYSTEM rows for a specific set of PWSIDs.
+MAX_ENRICH = 400
 
-    Uses the IN operator so a set of ids costs one request per chunk rather
-    than one per system. If IN is unsupported the underlying query raises and
-    the caller falls back to the bulk state pull.
+
+def fetch_by_pwsid_bulk(table: str, pwsids: list[str], stats: list | None = None,
+                        workers: int = 8) -> pd.DataFrame:
+    """Fetch `table` rows for many PWSIDs using the single-filter per-PWSID URL.
+
+    This is the call the Word report already uses, and it is the one Envirofacts
+    handles reliably. Run in a small thread pool because it is one request per
+    system; capped so a broad search cannot fire thousands of requests.
     """
-    frames = []
-    capped = len(pwsids) > chunk * max_chunks
-    for i in range(0, min(len(pwsids), chunk * max_chunks), chunk):
-        ids = ",".join(pwsids[i:i + chunk])
-        df = ef_query("WATER_SYSTEM", [("PWSID", "IN", ids)], stats=stats)
-        if not df.empty:
-            frames.append(df)
-    if capped and stats is not None:
-        stats.append(FetchStats(
-            label="WATER_SYSTEM by PWSID", rows=0, pages=0, complete=False,
-            reason=f"{len(pwsids):,} systems matched but only "
-                   f"{chunk * max_chunks:,} were looked up",
-        ))
+    ids = list(dict.fromkeys(pwsids))
+    capped = len(ids) > MAX_ENRICH
+    ids = ids[:MAX_ENRICH]
+
+    frames: list[pd.DataFrame] = []
+    failures = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for df in pool.map(lambda i: fetch_table_by_pwsid(table, i), ids):
+            if df is None or df.empty:
+                failures += 1
+            else:
+                frames.append(df)
+
+    if stats is not None:
+        stat = FetchStats(label=f"{table} by PWSID", rows=sum(len(f) for f in frames),
+                          pages=len(ids))
+        if capped:
+            stat.complete = False
+            stat.reason = f"only the first {MAX_ENRICH} of {len(pwsids):,} systems were looked up"
+        elif failures:
+            stat.complete = False
+            stat.reason = f"{failures} of {len(ids)} lookups returned nothing"
+        stats.append(stat)
+
     if not frames:
         return pd.DataFrame()
     return df_upper(pd.concat(frames, ignore_index=True))
@@ -518,45 +537,60 @@ def _tidy(ws: pd.DataFrame, matched_on: str = "") -> pd.DataFrame:
     return out[cols].drop_duplicates("PWSID").sort_values("PWS_NAME").reset_index(drop=True)
 
 
-def areas_serving_place(sc: str, place: str, stats: list) -> pd.DataFrame:
-    """GEOGRAPHIC_AREA rows whose county OR served city matches `place`.
+def enrich_with_geography(candidates: pd.DataFrame, place: str,
+                          stats: list) -> pd.DataFrame:
+    """Attach real county / served-city to candidates and say why each matched.
 
-    This is the authoritative answer to "which systems serve this place".
-    WATER_SYSTEM.CITY_NAME is NOT -- that is the system's own (often
-    administrative) city, so an operator headquartered in one town matches for
-    systems it runs hundreds of miles away.
+    The county is fetched per-PWSID, the same single-filter call the Word
+    report uses -- which demonstrably works, while the chained-filter search
+    query does not. This is what makes COUNTY_SERVED populate and what
+    separates a genuine service-area match from a mailing-address collision.
     """
-    frames = []
-    for column, label in (("COUNTY_SERVED", "county"), ("CITY_SERVED", "served city")):
-        ga = ef_query("GEOGRAPHIC_AREA", [
-            ("STATE_SERVED", sc),
-            (column, "CONTAINING", place.upper()),
-        ], stats=stats)
-        ga = enforce_state(ga, sc, stats, f"GEOGRAPHIC_AREA {column}")
-        if ga.empty or "PWSID" not in ga.columns:
-            continue
-        keep = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
-        ga = ga[keep].copy()
-        ga["MATCHED_ON"] = label
-        frames.append(ga)
+    if candidates.empty or "PWSID" not in candidates.columns:
+        return candidates
 
-    if not frames:
-        return pd.DataFrame(columns=["PWSID", "CITY_SERVED", "COUNTY_SERVED", "MATCHED_ON"])
-    return pd.concat(frames, ignore_index=True).drop_duplicates("PWSID")
+    ids = candidates["PWSID"].astype(str).tolist()
+    ga = fetch_by_pwsid_bulk("GEOGRAPHIC_AREA", ids, stats=stats)
+
+    if ga.empty or "PWSID" not in ga.columns:
+        out = candidates.copy()
+        out["COUNTY_SERVED"] = ""
+        out["MATCHED_ON"] = "system city (county lookup unavailable)"
+        return out
+
+    keep = [c for c in ["PWSID", "CITY_SERVED", "COUNTY_SERVED"] if c in ga.columns]
+    ga = ga[keep].drop_duplicates("PWSID")
+    out = candidates.merge(ga, on="PWSID", how="left")
+
+    needle = (place or "").strip().upper()
+    city = out.get("CITY_SERVED", pd.Series([""] * len(out), index=out.index))
+    county = out.get("COUNTY_SERVED", pd.Series([""] * len(out), index=out.index))
+    city = city.fillna("").astype(str).str.upper()
+    county = county.fillna("").astype(str).str.upper()
+
+    if needle:
+        out["MATCHED_ON"] = "mailing address only"
+        out.loc[county.str.contains(needle, na=False), "MATCHED_ON"] = "county"
+        out.loc[city.str.contains(needle, na=False), "MATCHED_ON"] = "served city"
+    else:
+        out["MATCHED_ON"] = "system name"
+    return out
 
 
 def search_systems_targeted(state: str, name_query: str | None,
                             county_or_city: str | None) -> tuple[pd.DataFrame, list]:
     """Server-side system search. Raises if it cannot be satisfied narrowly.
 
-    Returns (results, stats) so the caller can show what was actually fetched
-    and whether any part of it came back incomplete.
+    Returns (results, stats) so the caller can show what was actually fetched.
 
-    A place-only search does NOT need the full state list: GEOGRAPHIC_AREA can
-    be filtered on county and served city server-side, and those PWSIDs looked
-    up in batches. Results carry MATCHED_ON so it is visible WHY each system is
-    in the list -- particularly for mailing-city matches, which are the noisy
-    ones.
+    Every Envirofacts request here carries exactly ONE filter, because the
+    service ignores all but one filter in a chain. The state is therefore
+    applied client-side, and county comes from per-PWSID lookups.
+
+    For a place, two independent candidate sources are unioned so the result
+    does not depend on a system's mailing address:
+      - GEOGRAPHIC_AREA CITY_SERVED / COUNTY_SERVED -- systems that serve it
+      - WATER_SYSTEM CITY_NAME -- systems whose own city matches
     """
     sc = (state or "").strip().upper()
     name = (name_query or "").strip()
@@ -568,72 +602,63 @@ def search_systems_targeted(state: str, name_query: str | None,
     if not name and not place:
         raise ValueError("targeted search needs a system name or a place")
 
+    candidates = pd.DataFrame()
+
     if name:
         tokens = [t for t in re.findall(r"[A-Za-z0-9]+", name) if t]
         if not tokens:
             raise ValueError("no usable name tokens")
         lead = max(tokens, key=len)
 
-        ws = ef_query("WATER_SYSTEM", [
-            ("STATE_CODE", sc),
-            ("PWS_NAME", "CONTAINING", lead.upper()),
-        ], stats=stats)
+        ws = ef_query("WATER_SYSTEM", "PWS_NAME", lead.upper(), "CONTAINING", stats=stats)
         ws = enforce_state(ws, sc, stats, "WATER_SYSTEM name")
-        if ws.empty or "PWSID" not in ws.columns:
-            return _empty_result(), stats
+        if not ws.empty and "PWS_NAME" in ws.columns:
+            remaining = [t for t in tokens if t != lead]
+            if remaining:
+                ws = ws[token_and_contains(ws["PWS_NAME"], remaining)]
+        candidates = ws
+    else:
+        # Systems that SERVE the place, by served city and by county.
+        area_ids: list[str] = []
+        for column in ("CITY_SERVED", "COUNTY_SERVED"):
+            ga = ef_query("GEOGRAPHIC_AREA", column, place.upper(), "CONTAINING", stats=stats)
+            ga = enforce_state(ga, sc, stats, f"GEOGRAPHIC_AREA {column}")
+            if not ga.empty and "PWSID" in ga.columns:
+                area_ids.extend(ga["PWSID"].dropna().astype(str).tolist())
 
-        keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in ws.columns]
-        ws = ws[keep].drop_duplicates("PWSID")
-        remaining = [t for t in tokens if t != lead]
-        if remaining and "PWS_NAME" in ws.columns:
-            ws = ws[token_and_contains(ws["PWS_NAME"], remaining)]
+        # Systems whose own city matches (mailing address; kept, then labelled).
+        by_city = ef_query("WATER_SYSTEM", "CITY_NAME", place.upper(), "CONTAINING", stats=stats)
+        by_city = enforce_state(by_city, sc, stats, "WATER_SYSTEM city")
 
-        if not place:
-            return _tidy(ws, "system name"), stats
+        known = set(by_city["PWSID"].astype(str)) if "PWSID" in by_city.columns else set()
+        missing = [i for i in dict.fromkeys(area_ids) if i not in known]
 
-        areas = areas_serving_place(sc, place, stats)
-        if areas.empty:
-            return _empty_result(), stats
-        merged = ws.merge(areas, on="PWSID", how="inner")
-        return _tidy(merged), stats
+        frames = [by_city] if not by_city.empty else []
+        if missing:
+            extra = fetch_by_pwsid_bulk("WATER_SYSTEM", missing, stats=stats)
+            extra = enforce_state(extra, sc, stats, "WATER_SYSTEM by PWSID")
+            if not extra.empty:
+                frames.append(extra)
+        if frames:
+            candidates = pd.concat(frames, ignore_index=True)
 
-    # ---- Place only ----
-    # GEOGRAPHIC_AREA is authoritative for "serves this place".
-    areas = areas_serving_place(sc, place, stats)
-
-    # WATER_SYSTEM.CITY_NAME is included as a secondary signal, clearly
-    # labelled, because it is the system's own city and produces matches far
-    # from the place being searched.
-    by_city = ef_query("WATER_SYSTEM", [
-        ("STATE_CODE", sc),
-        ("CITY_NAME", "CONTAINING", place.upper()),
-    ], stats=stats)
-    by_city = enforce_state(by_city, sc, stats, "WATER_SYSTEM city")
-
-    area_ids = areas["PWSID"].astype(str).tolist() if not areas.empty else []
-    known = set(by_city["PWSID"].astype(str)) if "PWSID" in by_city.columns else set()
-    missing = [i for i in area_ids if i not in known]
-
-    frames = []
-    if not by_city.empty:
-        keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in by_city.columns]
-        frames.append(by_city[keep])
-    if missing:
-        extra = ef_systems_by_pwsid(missing, stats=stats)
-        extra = enforce_state(extra, sc, stats, "WATER_SYSTEM by PWSID")
-        if not extra.empty:
-            keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in extra.columns]
-            frames.append(extra[keep])
-    if not frames:
+    if candidates.empty or "PWSID" not in candidates.columns:
         return _empty_result(), stats
 
-    combined = pd.concat(frames, ignore_index=True).drop_duplicates("PWSID")
-    if not areas.empty:
-        combined = combined.merge(areas, on="PWSID", how="left")
-    combined["MATCHED_ON"] = combined.get(
-        "MATCHED_ON", pd.Series([""] * len(combined), index=combined.index)
-    ).fillna("").replace("", "system city (mailing address, may be far away)")
-    return _tidy(combined), stats
+    keep = [c for c in ["PWSID", "PWS_NAME", "CITY_NAME"] if c in candidates.columns]
+    candidates = candidates[keep].drop_duplicates("PWSID")
+
+    enriched = enrich_with_geography(candidates, place, stats)
+
+    if name and place:
+        needle = place.upper()
+        enriched = enriched[enriched["MATCHED_ON"].isin(["served city", "county"])]
+        if enriched.empty:
+            stats.append(FetchStats(
+                label=f"place filter {needle}", rows=0, pages=0, complete=True,
+                reason="no candidate system serves that place",
+            ))
+    return _tidy(enriched), stats
 
 
 def looks_like_pwsid(s: str) -> bool:
