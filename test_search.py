@@ -98,7 +98,7 @@ def test_never_chains_two_filters():
     calls = []
     R._session = _stub(calls)
     R.search_systems_targeted("CA", None, "porterville")
-    searches = [c for c in calls if "/Rows/" in c]
+    searches = _search_calls(calls)
     assert searches, calls
     for c in searches:
         path = c.split("/efservice/")[1].split("/Rows/")[0]
@@ -107,11 +107,16 @@ def test_never_chains_two_filters():
         assert len(segments) <= 4, f"chained filter leaked back in: {path}"
 
 
+def _search_calls(calls):
+    """Search queries only -- per-PWSID detail lookups are paged too now."""
+    return [c for c in calls if "/Rows/" in c and "/PWSID/" not in c]
+
+
 def test_name_search_is_one_search_request():
     calls = []
     R._session = _stub(calls)
     out, stats = R.search_systems_targeted("CA", "porterville", None)
-    searches = [c for c in calls if "/Rows/" in c]
+    searches = _search_calls(calls)
     assert len(searches) == 1, searches
     assert "PWS_NAME/CONTAINING/PORTERVILLE" in searches[0]
     assert not out.empty
@@ -252,6 +257,30 @@ def test_place_search_lists_every_match_including_address_only():
     assert labels["CA4700884"] == "system address", labels
     assert dict(zip(out["PWSID"], out["COUNTY_SERVED"]))["CA4700884"] == "SISKIYOU"
     assert all(s.complete for s in stats), [s.describe() for s in stats]
+
+
+def test_per_pwsid_fetch_is_paged():
+    """The bare /PWSID/<id>/JSON URL gives no way to tell a complete answer
+    from one truncated at the service's default row limit."""
+    seen = []
+
+    def fake(url):
+        seen.append(url)
+        return [{"PWSID": "CA3110008", "COUNTY_SERVED": "PLACER"}]
+
+    original, R.api_get_json = R.api_get_json, fake
+    try:
+        R.fetch_table_by_pwsid("GEOGRAPHIC_AREA", "CA3110008")
+    finally:
+        R.api_get_json = original
+    assert "/Rows/0:" in seen[0], seen[0]
+
+
+def test_reference_codes_fill_gaps():
+    """Unmapped codes printed raw in reports -- "Activity Status: N"."""
+    assert R.CODE_DESCRIPTIONS["PWS_ACTIVITY_CODE"]["N"] == "Changed from public to non-public"
+    assert R.CODE_DESCRIPTIONS["FACILITY_TYPE_CODE"]["DS"] == "Distribution System/Zone"
+    assert R.CODE_DESCRIPTIONS["VIOLATION_CATEGORY_CODE"]["MON"] == "Monitoring Violation"
 
 
 def test_no_criteria_raises_so_caller_falls_back():

@@ -1,6 +1,8 @@
 # sdwis_ca_report.py — imports
 import sys
 import io
+import os
+import csv
 import re
 import time
 import functools
@@ -234,6 +236,63 @@ CODE_DESCRIPTIONS["TREATMENT_PROCESS_CODE"] = {
     **CODE_DESCRIPTIONS.get("TREATMENT_PROCESS_CODE", {}),
     **TREATMENT_PROCESS_MAP,
 }
+
+# ---------------- Reference code values ----------------
+#
+# SDWA_REF_CODE_VALUES.csv is EPA's own list of code meanings and ships with
+# this repo. The hardcoded CODE_DESCRIPTIONS above were incomplete -- 21 codes
+# across 5 types had no entry, and desc() falls back to printing the raw code,
+# so reports showed "Activity Status: N" instead of "Changed from public to
+# non-public", and half of all FACILITY_TYPE_CODE values rendered as two-letter
+# codes. The reference file fills those gaps; hand-written wording still wins
+# where it exists.
+
+REF_CODE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "SDWA_REF_CODE_VALUES.csv")
+
+# App column name -> VALUE_TYPE in the reference file, where they differ.
+REF_TYPE_ALIASES = {
+    "PWS_ACTIVITY_CODE": "ACTIVITY_CODE",
+    "FACILITY_ACTIVITY_CODE": "ACTIVITY_CODE",
+}
+
+
+def load_reference_codes(path: str = REF_CODE_PATH) -> dict[str, dict[str, str]]:
+    """VALUE_TYPE -> {VALUE_CODE: VALUE_DESCRIPTION} from EPA's reference file."""
+    out: dict[str, dict[str, str]] = {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                vtype = (row.get("VALUE_TYPE") or "").strip()
+                code = (row.get("VALUE_CODE") or "").strip()
+                desc_text = (row.get("VALUE_DESCRIPTION") or "").strip()
+                if vtype and code:
+                    out.setdefault(vtype, {})[code] = desc_text
+    except Exception as e:  # noqa: BLE001 - reference file is optional
+        print(f"[codes] could not read {path}: {e}")
+    return out
+
+
+def _merge_reference_codes() -> int:
+    """Fill gaps in CODE_DESCRIPTIONS from the reference file. Returns count added."""
+    ref = load_reference_codes()
+    if not ref:
+        return 0
+    added = 0
+    for key in list(CODE_DESCRIPTIONS):
+        vtype = REF_TYPE_ALIASES.get(key, key)
+        for code, text in ref.get(vtype, {}).items():
+            if code not in CODE_DESCRIPTIONS[key]:
+                CODE_DESCRIPTIONS[key][code] = text
+                added += 1
+    # Also expose reference-only types the app does not hardcode at all.
+    for vtype, mapping in ref.items():
+        CODE_DESCRIPTIONS.setdefault(vtype, dict(mapping))
+    return added
+
+
+CODES_ADDED_FROM_REFERENCE = _merge_reference_codes()
+
 
 # Paging for local pulls (bump if needed)
 PAGE_SIZE = 50000
@@ -814,6 +873,8 @@ def search_by_name(state_code: str, name_query: str, county_filter: str | None) 
 # ----------------------- Fetch tables & report -----------------------
 
 FETCH_RETRIES = 3
+PWSID_PAGE_SIZE = 1000
+PWSID_MAX_PAGES = 20
 
 
 def fetch_table_by_pwsid(table: str, pwsid: str,
@@ -827,14 +888,33 @@ def fetch_table_by_pwsid(table: str, pwsid: str,
     report as "No data available." -- a fetch failure silently became a
     factual-looking statement about the water system.
     """
-    url = PWSID_URL.format(table=table, pwsid=pwsid)
     last_error = None
     for attempt in range(max(1, retries)):
         try:
-            data = api_get_json(url)
-            df = pd.DataFrame(data) if isinstance(data, list) and data else pd.DataFrame()
+            # Paged explicitly. The bare /PWSID/<id>/JSON URL returns whatever
+            # the service's default row limit allows, with no way to tell a
+            # complete answer from a truncated one -- so ask for windows and
+            # stop only when a short page proves the end was reached.
+            parts, truncated = [], False
+            for page in range(PWSID_MAX_PAGES):
+                lo = page * PWSID_PAGE_SIZE
+                hi = lo + PWSID_PAGE_SIZE - 1
+                url = f"{BASE}/{table}/PWSID/{pwsid}/Rows/{lo}:{hi}/JSON"
+                data = api_get_json(url)
+                if not isinstance(data, list) or not data:
+                    break
+                parts.append(pd.DataFrame(data))
+                if len(data) < PWSID_PAGE_SIZE:
+                    break
+            else:
+                truncated = True
+
+            df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
             out = df_upper(df)
-            out.attrs["fetch_error"] = None
+            out.attrs["fetch_error"] = (
+                f"stopped at the {PWSID_MAX_PAGES}-page cap; more rows exist"
+                if truncated else None
+            )
             return out
         except Exception as e:  # noqa: BLE001 - retry any transport failure
             last_error = e
@@ -965,8 +1045,13 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     county = "N/A"
     if not ga.empty and "COUNTY_SERVED" in ga.columns:
         non_empty = ga["COUNTY_SERVED"].dropna().astype(str).str.strip()
+        non_empty = non_empty[non_empty != ""]
         if not non_empty.empty:
-            county = non_empty.iloc[0] or "N/A"
+            county = non_empty.iloc[0]
+    if county == "N/A" and fetch_error_of(ga):
+        # Distinguish "SDWIS has no county for this system" from "the request
+        # failed"; printing N/A for a failure invents a fact about the system.
+        county = "Not retrieved (SDWIS request failed)"
 
     doc = Document()
     doc.add_heading(f"Summary Information for Water Utility {pwsid}", level=0)
