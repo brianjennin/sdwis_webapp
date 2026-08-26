@@ -12,10 +12,14 @@ would otherwise fail silently in production:
 
     python test_search.py
 """
+import importlib.util
 import sys
 import types
 
-sys.modules.setdefault("docx", types.ModuleType("docx"))
+# Use the real python-docx when installed, so reports can actually be
+# rendered; fall back to a dummy so the rest of the suite runs without it.
+if importlib.util.find_spec("docx") is None:
+    sys.modules.setdefault("docx", types.ModuleType("docx"))
 import sdwis_ca_report as R  # noqa: E402
 
 WS_CSV = (
@@ -401,6 +405,69 @@ def test_real_violation_count():
     assert len(vio) == 1, len(vio)
     assert vio[0]["violation_category_code"] == "MR"
     assert vio[0]["is_health_based_ind"] == "N"
+
+
+def test_real_service_area_data():
+    """SERVICE_AREA was fetched for every report and never rendered.
+
+    CITY OF ROSEVILLE is both a Residential Area (primary) and a Wholesaler of
+    Water -- the second fact appeared nowhere in the report before.
+    """
+    sa = _load_fixture("CA3110008_service_area.json")
+    assert len(sa) == 2, len(sa)
+    types_ = {r["service_area_type_code"] for r in sa}
+    assert types_ == {"RA", "WH"}, types_
+    for code in types_:
+        assert code in R.CODE_DESCRIPTIONS["SERVICE_AREA_TYPE_CODE"]
+
+
+def test_report_renders_from_real_data():
+    """End-to-end render of CA3110008 from captured SDWIS responses.
+
+    Pins the section content against real data, including the Service Area
+    table and the null primary-flag that rendered as "NAN" on first attempt.
+    """
+    if not getattr(R, "HAVE_DOCX", False):
+        print("      (skipped: python-docx not installed)")
+        return
+    import pandas as pd
+    import tempfile
+    import os
+    from docx import Document
+
+    def fx(name):
+        return pd.DataFrame(_load_fixture(f"CA3110008_{name}.json"))
+
+    data = {
+        "WATER_SYSTEM": fx("water_system"),
+        "GEOGRAPHIC_AREA": fx("geographic_area"),
+        "WATER_SYSTEM_FACILITY": fx("water_system_facility"),
+        "VIOLATION": fx("violation"),
+        "TREATMENT": fx("treatment"),
+        "SERVICE_AREA": fx("service_area"),
+    }
+    out = os.path.join(tempfile.mkdtemp(), "CA3110008.docx")
+    R.generate_report("CA3110008", data, out_path=out)
+    doc = Document(out)
+
+    text = "\n".join(p.text for p in doc.paragraphs)
+    assert "CITY OF ROSEVILLE" in text
+    assert "County Served: Placer" in text
+    assert "Activity Status: Active" in text
+    assert "34 facilities" in text and "19 sources" in text
+    assert "Service Area" in text
+
+    sizes = [(len(tb.rows) - 1, [c.text for c in tb.rows[0].cells]) for tb in doc.tables]
+    by_header = {tuple(h): n for n, h in sizes}
+    assert by_header[("Service Area Type", "Primary?")] == 2, sizes
+
+    sa_tbl = next(tb for tb in doc.tables
+                  if [c.text for c in tb.rows[0].cells] == ["Service Area Type", "Primary?"])
+    rows = [[c.text for c in r.cells] for r in sa_tbl.rows[1:]]
+    assert rows == [["Residential Area", "Yes"],
+                    ["Wholesaler of Water", "N/A"]], rows
+    for row in rows:
+        assert "NAN" not in row[1].upper(), row
 
 
 def test_no_criteria_raises_so_caller_falls_back():

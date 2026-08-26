@@ -1009,7 +1009,11 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
 
     def yn_from(code: str | None) -> str:
         s = ("" if code is None else str(code).strip().upper())
-        return {"Y": "Yes", "N": "No"}.get(s, s or "N/A")
+        # A null that has been through astype(str) arrives as "NAN"/"NONE";
+        # without this the report prints NAN where SDWIS simply has no value.
+        if s in ("", "NAN", "NONE", "NAT", "<NA>"):
+            return "N/A"
+        return {"Y": "Yes", "N": "No"}.get(s, s)
 
     def active_from(code: str | None) -> str:
         s = ("" if code is None else str(code).strip().upper())
@@ -1049,6 +1053,7 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     wsf = u(data.get("WATER_SYSTEM_FACILITY", pd.DataFrame()))
     vio = u(data.get("VIOLATION", pd.DataFrame()))
     trt = u(data.get("TREATMENT", pd.DataFrame()))  # optional; used to enrich treatment rows
+    srv = u(data.get("SERVICE_AREA", pd.DataFrame()))
 
     # ---------------- summary ----------------
     ws_name     = get1(ws, "PWS_NAME")
@@ -1228,6 +1233,40 @@ def generate_report(pwsid: str, data: dict[str, pd.DataFrame], out_path: str | N
     # else: omit Storage section
 
     # ======================== Violations ========================
+    # ======================== Service Area ========================
+    # SERVICE_AREA was already being fetched for every report and then never
+    # rendered. It answers "who does this system actually serve" -- CITY OF
+    # ROSEVILLE, for instance, is both a Residential Area (primary) and a
+    # Wholesaler of Water, which the rest of the report never showed.
+    doc.add_heading("Service Area", level=1)
+    sa_rows = []
+    if not srv.empty and "SERVICE_AREA_TYPE_CODE" in srv.columns:
+        sa_df = srv.copy()
+        for c in ("SERVICE_AREA_TYPE_CODE", "IS_PRIMARY_SERVICE_AREA_CODE"):
+            if c in sa_df.columns:
+                sa_df[c] = sa_df[c].fillna("").astype(str)
+        sa_df = sa_df.drop_duplicates(
+            subset=[c for c in ["SERVICE_AREA_TYPE_CODE"] if c in sa_df.columns]
+        )
+        # Primary areas first, then alphabetically by description.
+        sa_df["_primary"] = (
+            sa_df.get("IS_PRIMARY_SERVICE_AREA_CODE", "").astype(str).str.upper().eq("Y")
+        )
+        sa_df["_label"] = sa_df["SERVICE_AREA_TYPE_CODE"].map(
+            lambda c: desc("SERVICE_AREA_TYPE_CODE", c)
+        )
+        sa_df = sa_df.sort_values(["_primary", "_label"], ascending=[False, True],
+                                  kind="mergesort")
+        for _, r in sa_df.iterrows():
+            sa_rows.append([
+                r["_label"],
+                yn_from(r.get("IS_PRIMARY_SERVICE_AREA_CODE", "")),
+            ])
+    if sa_rows:
+        add_table(doc, headers=["Service Area Type", "Primary?"], rows=sa_rows)
+    else:
+        doc.add_paragraph(no_data(srv))
+
     doc.add_heading("Violations", level=1)
 
     def vio_rows_from(df: pd.DataFrame) -> list[list[str]]:
