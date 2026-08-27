@@ -352,14 +352,23 @@ if pwsid_to_generate:
 
 # ---------------- Groundwater map ----------------
 #
-# Gated behind an expander that is closed by default AND checked before the
-# module does any work. Streamlit runs the whole script on every rerun, so an
-# always-rendered map would cost on every keystroke elsewhere in the page.
+# Remembered in session state rather than read from pwsid_to_generate, which is
+# assigned inside an `if st.button(...)` block and is therefore non-None for
+# exactly one rerun. Opening the expander is itself a rerun, so reading the
+# local would make the section delete itself the instant anyone clicked it.
+#
+# Still gated: the expander is collapsed by default and gw_map imports folium
+# lazily, so a session that never opens it pays nothing.
 
 if pwsid_to_generate:
-    with st.expander("Groundwater vulnerability & map", expanded=False):
+    st.session_state.gw_pwsid = pwsid_to_generate
+
+gw_pwsid = st.session_state.get("gw_pwsid")
+if gw_pwsid:
+    with st.expander(f"Groundwater vulnerability & map — {gw_pwsid}",
+                     expanded=False):
         import gw_map
-        gw_map.render(pwsid_to_generate)
+        gw_map.render(gw_pwsid)
 
 
 with st.expander("Developer tools"):
