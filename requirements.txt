@@ -3,3 +3,5 @@ python-docx>=1.1
 requests>=2.31
 pandas>=2.1
 urllib3>=2.0
+folium>=0.15
+streamlit-folium>=0.20

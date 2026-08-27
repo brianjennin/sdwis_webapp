@@ -350,6 +350,18 @@ if pwsid_to_generate:
         )
     st.success("Report generated.")
 
+# ---------------- Groundwater map ----------------
+#
+# Gated behind an expander that is closed by default AND checked before the
+# module does any work. Streamlit runs the whole script on every rerun, so an
+# always-rendered map would cost on every keystroke elsewhere in the page.
+
+if pwsid_to_generate:
+    with st.expander("Groundwater vulnerability & map", expanded=False):
+        import gw_map
+        gw_map.render(pwsid_to_generate)
+
+
 with st.expander("Developer tools"):
     if st.button("Clear app cache"):
         st.cache_data.clear()
