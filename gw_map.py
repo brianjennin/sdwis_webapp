@@ -20,6 +20,7 @@ first.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -75,6 +76,73 @@ def bounds_of(geometry: dict) -> tuple[float, float, float, float]:
     if not lons:
         return (0.0, 0.0, 0.0, 0.0)
     return (min(lons), min(lats), max(lons), max(lats))
+
+
+
+def _to_metres(lon, lat, lon0, lat0):
+    """Local planar approximation, good to a fraction of a percent at 2 km."""
+    return ((lon - lon0) * 111_320.0 * math.cos(math.radians(lat0)),
+            (lat - lat0) * 110_540.0)
+
+
+def _rings(geometry: dict) -> list[list]:
+    """Every ring of a Polygon or MultiPolygon, as coordinate lists."""
+    kind = geometry.get("type")
+    coords = geometry.get("coordinates", [])
+    if kind == "Polygon":
+        return list(coords)
+    if kind == "MultiPolygon":
+        return [ring for polygon in coords for ring in polygon]
+    if kind == "Point":
+        return [[coords]]
+    return []
+
+
+def distance_to_geometry_m(lon: float, lat: float, geometry: dict) -> float:
+    """Metres from a point to a service-area geometry; 0 if inside it.
+
+    The index counts wells within `search_radius_m` of the service-area
+    BOUNDARY, so the map has to measure the same thing. Filtering on a
+    bounding box instead draws wells that never fed the number, which reads
+    as a contradiction when the caption says six wells and the map shows ten.
+    """
+    rings = _rings(geometry)
+    if not rings:
+        return float("inf")
+
+    lon0, lat0 = lon, lat
+    best = float("inf")
+    for ring in rings:
+        points = [_to_metres(c[0], c[1], lon0, lat0) for c in ring if len(c) >= 2]
+        if not points:
+            continue
+        if len(points) == 1:                       # placeholder point geometry
+            best = min(best, math.hypot(*points[0]))
+            continue
+
+        # Inside the ring counts as zero distance, matching ST_Distance.
+        inside = False
+        for i in range(len(points)):
+            x1, y1 = points[i]
+            x2, y2 = points[(i + 1) % len(points)]
+            if (y1 > 0) != (y2 > 0):
+                cross = x1 + (0 - y1) * (x2 - x1) / (y2 - y1)
+                if cross > 0:
+                    inside = not inside
+            best = min(best, _point_to_segment(x1, y1, x2, y2))
+        if inside:
+            return 0.0
+    return best
+
+
+def _point_to_segment(x1: float, y1: float, x2: float, y2: float) -> float:
+    """Distance from the origin to the segment (x1,y1)-(x2,y2)."""
+    dx, dy = x2 - x1, y2 - y1
+    length2 = dx * dx + dy * dy
+    if length2 == 0:
+        return math.hypot(x1, y1)
+    t = max(0.0, min(1.0, -(x1 * dx + y1 * dy) / length2))
+    return math.hypot(x1 + t * dx, y1 + t * dy)
 
 
 def render(pwsid: str) -> None:
@@ -173,40 +241,60 @@ def _draw_map(pwsid: str, record: dict) -> None:
             fields=["pws_name", "pwsid"], aliases=["System", "PWSID"]),
     ).add_to(fmap)
 
-    # Only wells inside the padded box: the rest of the basin is not this
-    # system's evidence, and every extra marker is payload on every rerun.
-    shown = 0
+    # Distance to the service-area geometry, not a bounding box. The index
+    # counts wells within search_radius_m of the boundary, so the map has to
+    # measure the same thing -- a box filter draws wells that never fed the
+    # number, and the caption then says six wells over a map showing ten.
+    radius = float(record["search_radius_m"])
+    used, nearby = [], []
     for feature in wells["features"]:
         lon, lat = feature["geometry"]["coordinates"][:2]
-        if not (min_lon - pad <= lon <= max_lon + pad
-                and min_lat - pad <= lat <= max_lat + pad):
+        if feature["properties"].get("slope_ft_per_yr") is None:
             continue
-        props = feature["properties"]
-        slope = props.get("slope_ft_per_yr")
-        if slope is None:
-            continue
+        metres = distance_to_geometry_m(lon, lat, target["geometry"])
+        if metres <= radius:
+            used.append((lon, lat, feature["properties"], metres))
+        elif metres <= radius * 2.5:
+            nearby.append((lon, lat, feature["properties"], metres))
+
+    # Context first, so contributing wells draw on top of it.
+    for lon, lat, props, metres in nearby:
+        folium.CircleMarker(
+            location=[lat, lon], radius=3,
+            color="#9a9a96", weight=0.8, fill=True,
+            fill_color="#ffffff", fill_opacity=0.55,
+            tooltip=(f"{props.get('station_id', 'well')} — "
+                     f"{metres/1000:.1f} km away<br>"
+                     f"Outside the {radius/1000:.0f} km radius; "
+                     f"not used for this system"),
+        ).add_to(fmap)
+
+    for lon, lat, props, metres in used:
+        slope = props["slope_ft_per_yr"]
         significant = (props.get("p_value") or 1.0) <= 0.05
         folium.CircleMarker(
             location=[lat, lon],
             radius=4 + min(abs(slope), 6) * 0.8,
             color=INK if significant else "#ffffff",
-            weight=1.2 if significant else 0.8,
+            weight=1.4 if significant else 0.8,
             fill=True,
             fill_color=DECLINE if slope < 0 else RISE,
             fill_opacity=0.85,
             tooltip=(f"{props.get('station_id', 'well')}<br>"
                      f"{slope:+.2f} ft/yr"
                      f"{'' if significant else ' (not significant)'}<br>"
+                     f"{metres/1000:.1f} km from the service area<br>"
                      f"{props.get('n_measurements', '?')} measurements"),
         ).add_to(fmap)
-        shown += 1
 
-    # returned_objects=[] via folium_static: no rerun on pan or zoom, which
-    # would otherwise re-render the whole page every time the map is touched.
     folium_static(fmap, width=700, height=460)
     st.caption(
-        f"Service area in blue; {shown} monitoring well"
-        f"{'s' if shown != 1 else ''} shown. Red = water level falling, "
-        "blue = rising; larger means faster. A dark outline marks a "
+        f"Service area in blue. **{len(used)} well"
+        f"{'s' if len(used) != 1 else ''} within "
+        f"{radius/1000:.0f} km fed this system's index** — red = falling, "
+        "blue = rising, larger means faster, a dark outline marks a "
         "statistically significant trend."
+        + (f" {len(nearby)} further well{'s' if len(nearby) != 1 else ''} "
+           "shown hollow for context; those are outside the radius and did "
+           "not contribute." if nearby else "")
     )
