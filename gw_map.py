@@ -3,9 +3,10 @@
 Reads files produced by the sibling pipeline (brianjennin/gw_vulnerability,
 `python run.py export-app`) and dropped into data/gw/ here:
 
-    sgti_by_pwsid.csv          index: which PWSIDs have a result
-    <basin>_systems.geojson    service-area boundaries + their index value
-    <basin>_wells.geojson      monitoring wells that carry a trend
+    sgti_by_pwsid.csv            index: which PWSIDs have a result
+    <basin>_systems.geojson      service-area boundaries + their index value
+    <basin>_wells.geojson        monitoring wells that carry a trend
+    <basin>_system_wells.json    which wells fed which system's index
 
 No GeoPandas, GDAL or SpatiaLite: the pipeline does the spatial work, this
 reads plain JSON and CSV. folium is imported inside render() rather than at
@@ -47,6 +48,19 @@ def load_geojson(name: str) -> dict:
     path = DATA_DIR / name
     if not path.exists():
         return {"type": "FeatureCollection", "features": []}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@st.cache_data(show_spinner=False)
+def load_membership(slug: str) -> dict:
+    """{pwsid: [[station_id, distance_m], ...]} as the pipeline computed it.
+
+    Empty for an export made before this file existed; _draw_map falls back to
+    measuring distances itself in that case.
+    """
+    path = DATA_DIR / f"{slug}_system_wells.json"
+    if not path.exists():
+        return {}
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -145,6 +159,21 @@ def _point_to_segment(x1: float, y1: float, x2: float, y2: float) -> float:
     return math.hypot(x1 + t * dx, y1 + t * dy)
 
 
+ALPHA = 0.05          # matches the pipeline's config.yml
+
+
+def is_significant(props: dict) -> bool:
+    """Whether this well's Mann-Kendall trend clears the significance level.
+
+    Written out rather than `props.get("p_value") or 1.0` because a strongly
+    trending well has a p-value that rounds to 0.0 on export, and 0.0 is falsy
+    -- the shorthand read it as p = 1.0 and labelled the clearest trends in the
+    dataset "not significant".
+    """
+    p_value = props.get("p_value")
+    return p_value is not None and float(p_value) <= ALPHA
+
+
 def render(pwsid: str) -> None:
     """Draw the vulnerability summary and map for one system."""
     record = lookup(pwsid)
@@ -169,7 +198,6 @@ def render(pwsid: str) -> None:
     rank = int(record["vuln_rank"])
     total = int(record["systems_ranked"])
     n_wells = int(record["n_wells_used"])
-    n_sig = int(record["n_wells_significant"])
     radius_m = int(record["search_radius_m"])
     since = record.get("trend_start_year")
 
@@ -182,14 +210,14 @@ def render(pwsid: str) -> None:
                   help="1 = steepest decline in the basin.")
     right.metric("Wells used", f"{n_wells}",
                  help=f"Monitoring wells within {radius_m/1000:.0f} km of the "
-                      f"service area. {n_sig} show a statistically significant trend.")
+                      f"service area, weighted by distance. Hover a well on "
+                      f"the map for its trend and significance.")
 
     st.caption(
         f"Water levels beneath this system are **{direction}** at "
         f"{abs(sgti):.2f} ft/yr{f' since {int(since)}' if pd.notna(since) else ''}, "
         f"from {n_wells} monitoring well{'s' if n_wells != 1 else ''} within "
-        f"{radius_m/1000:.0f} km ({n_sig} statistically significant). "
-        f"{record['basin_name']}."
+        f"{radius_m/1000:.0f} km. {record['basin_name']}."
     )
     if n_wells <= 2:
         st.warning(
@@ -206,6 +234,51 @@ def render(pwsid: str) -> None:
         "system's own well records: exposure depends on well depth, screen "
         "interval and pump setting, none of which are in this data."
     )
+
+
+def select_wells(pwsid: str, record: dict, target: dict,
+                 wells: dict) -> tuple[list, list]:
+    """Split the basin's wells into (fed this index, shown for context).
+
+    Each entry is (lon, lat, properties, metres_from_service_area).
+    """
+    # Which wells fed this system's index is read from the pipeline, not
+    # re-derived here. Measuring from the exported polygon disagrees with
+    # ST_Distance by a metre or two -- the polygon is simplified and this is a
+    # planar approximation -- which is enough to add or drop a well sitting on
+    # the radius, and the map then contradicts its own caption.
+    radius = float(record["search_radius_m"])
+    membership = load_membership(record["basin_slug"]).get(pwsid.upper())
+
+    used, nearby = [], []
+    if membership is not None:
+        distances = {station: metres for station, metres in membership}
+        for feature in wells["features"]:
+            props = feature["properties"]
+            lon, lat = feature["geometry"]["coordinates"][:2]
+            if props.get("slope_ft_per_yr") is None:
+                continue
+            metres = distances.get(props.get("station_id"))
+            if metres is not None:
+                used.append((lon, lat, props, float(metres)))
+            else:
+                context = distance_to_geometry_m(lon, lat, target["geometry"])
+                if context <= radius * 2.5:
+                    nearby.append((lon, lat, props, context))
+    else:
+        # Export predates the membership file: measure, and accept that a well
+        # on the radius may be classified differently than the index did.
+        for feature in wells["features"]:
+            props = feature["properties"]
+            lon, lat = feature["geometry"]["coordinates"][:2]
+            if props.get("slope_ft_per_yr") is None:
+                continue
+            metres = distance_to_geometry_m(lon, lat, target["geometry"])
+            if metres <= radius:
+                used.append((lon, lat, props, metres))
+            elif metres <= radius * 2.5:
+                nearby.append((lon, lat, props, metres))
+    return used, nearby
 
 
 def _draw_map(pwsid: str, record: dict) -> None:
@@ -241,21 +314,8 @@ def _draw_map(pwsid: str, record: dict) -> None:
             fields=["pws_name", "pwsid"], aliases=["System", "PWSID"]),
     ).add_to(fmap)
 
-    # Distance to the service-area geometry, not a bounding box. The index
-    # counts wells within search_radius_m of the boundary, so the map has to
-    # measure the same thing -- a box filter draws wells that never fed the
-    # number, and the caption then says six wells over a map showing ten.
     radius = float(record["search_radius_m"])
-    used, nearby = [], []
-    for feature in wells["features"]:
-        lon, lat = feature["geometry"]["coordinates"][:2]
-        if feature["properties"].get("slope_ft_per_yr") is None:
-            continue
-        metres = distance_to_geometry_m(lon, lat, target["geometry"])
-        if metres <= radius:
-            used.append((lon, lat, feature["properties"], metres))
-        elif metres <= radius * 2.5:
-            nearby.append((lon, lat, feature["properties"], metres))
+    used, nearby = select_wells(pwsid, record, target, wells)
 
     # Context first, so contributing wells draw on top of it.
     for lon, lat, props, metres in nearby:
@@ -271,7 +331,7 @@ def _draw_map(pwsid: str, record: dict) -> None:
 
     for lon, lat, props, metres in used:
         slope = props["slope_ft_per_yr"]
-        significant = (props.get("p_value") or 1.0) <= 0.05
+        significant = is_significant(props)
         folium.CircleMarker(
             location=[lat, lon],
             radius=4 + min(abs(slope), 6) * 0.8,
