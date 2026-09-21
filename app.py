@@ -21,7 +21,6 @@ from sdwis_ca_report import (
     df_upper,
     token_and_contains,
     search_systems_targeted,
-    RateLimited,
 )
 
 st.set_page_config(page_title="SDWIS – Report Generator (All States)", layout="centered")
@@ -148,16 +147,21 @@ def run_search(state: str, name_query: str, county_or_city: str | None):
         try:
             results, stats = cached_targeted_search(state, name, place)
             return results, "targeted", stats
-        except RateLimited:
-            # Falling back here would be the wrong move: the bulk path pulls the
-            # whole state over several requests, into the same rate limit that
-            # just rejected one. Report it and let the user try again.
-            empty = pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY",
-                                          "COUNTY_SERVED"])
-            return empty, "rate-limited", []
-        except Exception as e:  # operator unsupported, service error, etc.
-            results, stats = bulk_search(state, name, place or None)
-            return results, f"fallback ({e.__class__.__name__}: {e})", stats
+        except Exception as e:  # rate limit, unsupported operator, outage
+            # The targeted query is an optimisation, not the only route. When
+            # it fails the full-state pull still answers the question -- and
+            # it is cached, so the cost lands on the first search only. That
+            # is a fallback working, not an error, and it is reported in the
+            # fetch-detail expander rather than as a banner over results the
+            # user can already see.
+            note = f"{e.__class__.__name__}: {e}"
+            try:
+                results, stats = bulk_search(state, name, place or None)
+                return results, f"full-state (targeted unavailable — {note})", stats
+            except Exception as e2:
+                empty = pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY",
+                                              "COUNTY_SERVED"])
+                return empty, f"failed ({note}; then {e2.__class__.__name__}: {e2})", []
 
     results, stats = bulk_search(state, name, place or None)
     return results, "full-state", stats
@@ -206,6 +210,23 @@ else:
                 st.session_state.search_how = how
                 st.session_state.search_stats = stats
 
+    # An empty result used to render nothing at all, which looks identical to
+    # the app having ignored the click.
+    how_now = st.session_state.get("search_how", "")
+    if st.session_state.matches is None and how_now:
+        if how_now.startswith("failed"):
+            limited = "RateLimited" in how_now
+            st.error(
+                "**EPA Envirofacts did not answer.** "
+                + ("It is rate-limiting requests from this app — wait a minute "
+                   "and search again. Limits apply per source IP, and this app "
+                   "shares one with everything hosted alongside it."
+                   if limited else
+                   "The service returned an error. Try again shortly.")
+            )
+        else:
+            st.info("No systems matched. Try fewer words, or a county or city.")
+
     # Show results + in-table single selection
     if st.session_state.matches is not None:
         st.subheader("Matches")
@@ -232,21 +253,6 @@ else:
                 "retrieved for some of them (the per-system lookup failed after "
                 "retries). Those rows show a blank County — re-run to retry."
             )
-        if how == "full-state":
-            st.info("Pulled the full state list — the slow path.")
-        elif how == "rate-limited":
-            st.warning(
-                "**EPA Envirofacts is rate-limiting this app.** The search was "
-                "retried a few times and still came back refused, so it was "
-                "stopped rather than escalated to the full-state pull, which "
-                "would make it worse.\n\nWait about a minute and search "
-                "again. Rate limits are applied per source IP, and this app "
-                "shares one with everything else hosted alongside it, so this "
-                "happens more often here than it does running locally."
-            )
-        elif how.startswith("fallback"):
-            st.warning(f"Targeted search unavailable, fell back to the full-state pull — {how}")
-
         if "MATCHED_ON" in st.session_state.matches.columns:
             counts = st.session_state.matches["MATCHED_ON"].value_counts()
             serves = int(counts.get("served city", 0) + counts.get("county", 0))
