@@ -21,6 +21,7 @@ from sdwis_ca_report import (
     df_upper,
     token_and_contains,
     search_systems_targeted,
+    RateLimited,
 )
 
 st.set_page_config(page_title="SDWIS – Report Generator (All States)", layout="centered")
@@ -147,6 +148,13 @@ def run_search(state: str, name_query: str, county_or_city: str | None):
         try:
             results, stats = cached_targeted_search(state, name, place)
             return results, "targeted", stats
+        except RateLimited:
+            # Falling back here would be the wrong move: the bulk path pulls the
+            # whole state over several requests, into the same rate limit that
+            # just rejected one. Report it and let the user try again.
+            empty = pd.DataFrame(columns=["PWSID", "PWS_NAME", "CITY",
+                                          "COUNTY_SERVED"])
+            return empty, "rate-limited", []
         except Exception as e:  # operator unsupported, service error, etc.
             results, stats = bulk_search(state, name, place or None)
             return results, f"fallback ({e.__class__.__name__}: {e})", stats
@@ -226,6 +234,16 @@ else:
             )
         if how == "full-state":
             st.info("Pulled the full state list — the slow path.")
+        elif how == "rate-limited":
+            st.warning(
+                "**EPA Envirofacts is rate-limiting this app.** The search was "
+                "retried a few times and still came back refused, so it was "
+                "stopped rather than escalated to the full-state pull, which "
+                "would make it worse.\n\nWait about a minute and search "
+                "again. Rate limits are applied per source IP, and this app "
+                "shares one with everything else hosted alongside it, so this "
+                "happens more often here than it does running locally."
+            )
         elif how.startswith("fallback"):
             st.warning(f"Targeted search unavailable, fell back to the full-state pull — {how}")
 

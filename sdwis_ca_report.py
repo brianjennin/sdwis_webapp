@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 import requests
+from urllib3.util.retry import Retry
 import pandas as pd
 
 # Word report support
@@ -310,22 +311,56 @@ FILTER_URL = BASE + "/{table}/{col}/{val}/Rows/{start}:{end}/JSON"
 
 # ----------------------- HTTP helpers -----------------------
 
-# (Optional) persistent session w/ small retry pool
+class RateLimited(RuntimeError):
+    """Envirofacts answered 429. Retrying harder is the wrong response."""
+
+
+# Retry policy. `max_retries=3` as a bare integer -- the previous setting --
+# retries CONNECTION failures only; an HTTP 429 or 503 is a perfectly good
+# response and is handed straight back to the caller. Envirofacts rate-limits
+# by source IP, and a shared host (Streamlit Community Cloud) shares that IP
+# with every other app on it, so 429 is the common failure there and was not
+# being retried at all.
+#
+# raise_on_status=False so an exhausted retry surfaces as a normal HTTPError
+# from raise_for_status(), carrying the status code, rather than urllib3's
+# MaxRetryError with the cause buried in a string.
+_retry = Retry(
+    total=3,
+    backoff_factor=1.0,                       # ~0s, 2s, 4s between attempts
+    status_forcelist=(429, 500, 502, 503, 504),
+    respect_retry_after_header=True,          # EPA sends Retry-After on 429
+    raise_on_status=False,
+)
+try:
+    _retry.allowed_methods = frozenset({"GET"})
+except AttributeError:                        # urllib3 < 2 spelled it differently
+    _retry.method_whitelist = frozenset({"GET"})
+
 _session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10,
+                                         max_retries=_retry)
 _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
 
+
 def api_get_json(url: str):
-    """GET with verify True then fallback to False (common in corp envs)."""
+    """GET, retrying without certificate verification only on a TLS failure.
+
+    The retry is here for TLS-intercepting corporate proxies. It used to catch
+    every exception, which meant a rate-limited or failing request was sent a
+    second time with verification switched off -- doubling the load that
+    caused the failure, and silently dropping certificate checking for reasons
+    that had nothing to do with certificates.
+    """
     try:
         r = _session.get(url, timeout=60)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
+    except requests.exceptions.SSLError:
         r = _session.get(url, timeout=60, verify=False)
-        r.raise_for_status()
-        return r.json()
+    if r.status_code == 429:
+        raise RateLimited(f"EPA Envirofacts rate-limited this request: {url}")
+    r.raise_for_status()
+    return r.json()
 
 def df_upper(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -482,7 +517,21 @@ def _ef_page(url_without_format: str) -> pd.DataFrame:
                 return pd.read_csv(io.StringIO(text), dtype=str, low_memory=False)
             data = r.json()
             return pd.DataFrame(data) if isinstance(data, list) and data else pd.DataFrame()
-        except Exception as e:  # noqa: BLE001 - any failure means try the next format
+        except requests.HTTPError as e:
+            # A rate limit or a server fault applies to the query, not to the
+            # format it was asked for. Asking again as JSON is a second request
+            # into the same wall, so stop here and let the caller decide.
+            status = getattr(e.response, "status_code", None)
+            if status == 429:
+                raise RateLimited(
+                    "EPA Envirofacts is rate-limiting this app "
+                    f"({url_without_format})") from e
+            if status is not None and status >= 500:
+                raise RuntimeError(
+                    f"EPA Envirofacts is unavailable ({status}): "
+                    f"{url_without_format}") from e
+            last_error = e
+        except Exception as e:  # noqa: BLE001 - a format problem; try the next
             last_error = e
     raise RuntimeError(f"Envirofacts query failed: {url_without_format} ({last_error})")
 
