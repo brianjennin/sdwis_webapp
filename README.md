@@ -3,6 +3,8 @@
 Streamlit web app that generates Word reports for US public water systems from
 EPA's Safe Drinking Water Information System (SDWIS).
 
+**Live app:** <https://sdwiswebapp-i8adsn9fzbwzhtxwt4pvzr.streamlit.app/>
+
 ## What it does
 
 - Looks up any US public water system by PWSID, or by name + county/city, or
@@ -14,6 +16,8 @@ EPA's Safe Drinking Water Information System (SDWIS).
   map and index computed by a sibling project.
 
 ## Run it
+
+The easiest way is the hosted app linked above. To run locally:
 
 ```bash
 pip install -r requirements.txt
